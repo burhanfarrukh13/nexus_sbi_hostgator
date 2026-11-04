@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+backend/vendor/
+backend/storage/
+backend/bootstrap/cache/*
+!backend/bootstrap/cache/.gitignore
+backend/public/hot
+backend/public/storage
+private-storage/
+web/node_modules/
+web/dist/
+web/.vite/
+*.log

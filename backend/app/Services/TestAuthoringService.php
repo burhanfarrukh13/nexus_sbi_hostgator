@@ -1,0 +1,278 @@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+class TestAuthoringService
+{
+    public function listAll(): array
+    {
+        return DB::table('tests')->orderByDesc('createdAt')->get()
+            ->map(fn (object $test): array => $this->testView($test))
+            ->all();
+    }
+
+    public function create(array $data, string $actorId): array
+    {
+        $actor = DB::table('users')->where('id', $actorId)->first();
+        if (!$actor) {
+            throw new NotFoundHttpException('Actor user not found');
+        }
+        $permissions = DB::table('user_role_assignments')
+            ->where('userId', $actorId)
+            ->pluck('permission')
+            ->all();
+        if (!in_array('admin', $permissions, true) && !in_array('teacher_assistant', $permissions, true)) {
+            throw new AccessDeniedHttpException('Missing permission: teacher_assistant or admin');
+        }
+
+        $folderIds = $data['folderIds'] ?? [];
+        if ($folderIds === []) {
+            throw new BadRequestHttpException('Select at least one course folder for this test.');
+        }
+        $folders = DB::table('folders')->whereIn('id', $folderIds)->get();
+        if ($folders->count() !== count($folderIds)) {
+            throw new BadRequestHttpException('One or more folderIds do not exist');
+        }
+        $totalMarks = (float) $data['totalMarks'];
+        if (!$this->validMark($totalMarks) || $totalMarks < 0.01 || $totalMarks > 10000) {
+            throw new BadRequestHttpException('Total marks must be positive and have at most two decimal places.');
+        }
+
+        $questions = $this->normalizeQuestions($data['questions'] ?? []);
+        if ($questions !== [] && empty($data['deadlineAt'])) {
+            throw new BadRequestHttpException('Set a deadline for every online test.');
+        }
+        $questionTotal = array_sum(array_column($questions, 'marks'));
+        if ($questions !== [] && abs($questionTotal - $totalMarks) > 1e-6) {
+            throw new BadRequestHttpException("Total marks must equal the sum of question marks ({$questionTotal}).");
+        }
+        if (!empty($data['deadlineAt']) && Carbon::parse($data['deadlineAt'])->lessThanOrEqualTo(now())) {
+            throw new BadRequestHttpException('The test deadline must be in the future.');
+        }
+
+        $id = (string) Str::uuid();
+        $now = now();
+        try {
+            DB::transaction(function () use ($data, $questions, $folderIds, $actorId, $totalMarks, $id, $now): void {
+                DB::table('tests')->insert([
+                    'id' => $id,
+                    'title' => trim($data['title']),
+                    'description' => array_key_exists('description', $data) && $data['description'] !== null
+                        ? trim($data['description'])
+                        : null,
+                    'testDate' => empty($data['testDate']) ? null : Carbon::parse($data['testDate'])->toDateString(),
+                    'totalMarks' => number_format($totalMarks, 2, '.', ''),
+                    'deadline_at' => empty($data['deadlineAt']) ? null : Carbon::parse($data['deadlineAt']),
+                    'questions' => json_encode($questions, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+                    'createdById' => $actorId,
+                    'classId' => $data['classId'] ?? null,
+                    'sectionId' => $data['sectionId'] ?? null,
+                    'contentCovered' => json_encode($data['contentCovered'] ?? [], JSON_THROW_ON_ERROR),
+                    'createdAt' => $now,
+                    'updatedAt' => $now,
+                ]);
+                foreach ($folderIds as $folderId) {
+                    DB::table('test_folders')->insert(['testId' => $id, 'folderId' => $folderId]);
+                }
+            });
+        } catch (QueryException $exception) {
+            throw $exception;
+        }
+
+        DB::table('audit_logs')->insert([
+            'id' => (string) Str::uuid(),
+            'event' => 'test_created',
+            'details' => "Test {$id} created",
+            'userId' => $actorId,
+            'createdAt' => now(),
+        ]);
+
+        return $this->testView(DB::table('tests')->where('id', $id)->first());
+    }
+
+    private function normalizeQuestions(array $questions): array
+    {
+        if (count($questions) > 100) {
+            throw new BadRequestHttpException('A test may contain at most 100 questions.');
+        }
+        $numbers = [];
+        $normalized = [];
+        foreach ($questions as $question) {
+            $number = (int) $question['questionNumber'];
+            if ($number < 1 || $number > 100 || isset($numbers[$number])) {
+                throw new BadRequestHttpException('Question numbers must be unique and between 1 and 100.');
+            }
+            $numbers[$number] = true;
+            $questionText = trim($question['questionText']);
+            $idealAnswer = trim($question['idealAnswer']);
+            if ($questionText === '' || $idealAnswer === '') {
+                throw new BadRequestHttpException("Question {$number} requires a question and answer.");
+            }
+            $scheme = $question['markingScheme'] ?? null;
+            if (!is_array($scheme) || $scheme === []) {
+                throw new BadRequestHttpException("Question {$number} requires a marking scheme.");
+            }
+            $criteria = [];
+            foreach ($scheme as $criterion) {
+                $name = preg_replace('/\s*\|\s*\d+(?:\.\d+)?\s*$/', '', $criterion['criterion']) ?? '';
+                $name = trim($name);
+                $marks = (float) $criterion['marks'];
+                if ($name === '' || !$this->validMark($marks) || $marks < 0.01) {
+                    throw new BadRequestHttpException("Question {$number} has an invalid marking criterion.");
+                }
+                $criteria[] = ['criterion' => $name, 'marks' => $marks];
+            }
+            $criteriaTotal = array_sum(array_column($criteria, 'marks'));
+            $marks = (float) $question['marks'];
+            if (!$this->validMark($marks) || $marks < 0.01 || abs($criteriaTotal - $marks) > 1e-6) {
+                throw new BadRequestHttpException("Question {$number} marks must equal its marking-criteria total ({$criteriaTotal}).");
+            }
+            $normalizedQuestion = [
+                'questionNumber' => $number,
+                'questionText' => $questionText,
+                'idealAnswer' => $idealAnswer,
+            ];
+            foreach (['questionSourceLocations', 'solutionSourceLocations'] as $locationKey) {
+                if (!empty($question[$locationKey])) {
+                    $normalizedQuestion[$locationKey] = $question[$locationKey];
+                }
+            }
+            if (!empty($question['difficulty'])) {
+                $normalizedQuestion['difficulty'] = $question['difficulty'];
+            }
+            $normalizedQuestion['markingScheme'] = $criteria;
+            $normalizedQuestion['marks'] = round($criteriaTotal, 2);
+            $normalized[] = $normalizedQuestion;
+        }
+        usort($normalized, static fn (array $a, array $b): int => $a['questionNumber'] <=> $b['questionNumber']);
+        foreach ($normalized as $index => $question) {
+            if ($question['questionNumber'] !== $index + 1) {
+                throw new BadRequestHttpException('Question numbers must be contiguous, starting at 1.');
+            }
+        }
+        return $normalized;
+    }
+
+    private function validMark(float $value): bool
+    {
+        return is_finite($value) && abs($value * 100 - round($value * 100)) < 1e-7;
+    }
+
+    private function testView(object $test): array
+    {
+        $folders = DB::table('test_folders as tf')
+            ->join('folders as f', 'f.id', '=', 'tf.folderId')
+            ->where('tf.testId', $test->id)
+            ->orderBy('f.name')
+            ->get([
+                'f.id', 'f.name', 'f.description', 'f.default_price as defaultPrice',
+                'f.coverImageUrl', 'f.subject_id as subjectId', 'f.createdAt', 'f.updatedAt',
+            ])->map(fn (object $folder): array => (array) $folder)->all();
+
+        $createdBy = null;
+        if (!empty($test->createdById)) {
+            $user = DB::table('users')->where('id', $test->createdById)
+                ->first(['id', 'email', 'role', 'studentId', 'fullName', 'phone', 'must_reset_password', 'createdAt', 'updatedAt']);
+            if ($user) {
+                $createdBy = [
+                    'id' => $user->id,
+                    'email' => $user->email,
+                    'role' => $user->role,
+                    'studentId' => $user->studentId,
+                    'fullName' => $user->fullName,
+                    'phone' => $user->phone,
+                    'mustResetPassword' => (bool) $user->must_reset_password,
+                    'createdAt' => $user->createdAt,
+                    'updatedAt' => $user->updatedAt,
+                ];
+            }
+        }
+
+        return [
+            'id' => $test->id,
+            'title' => $test->title,
+            'description' => $test->description,
+            'testDate' => $test->testDate,
+            'totalMarks' => number_format((float) $test->totalMarks, 2, '.', ''),
+            'deadlineAt' => $test->deadline_at,
+            'questions' => $this->decodeJson($test->questions, []),
+            'classId' => $test->classId,
+            'sectionId' => $test->sectionId,
+            'createdById' => $test->createdById,
+            'contentCovered' => $this->decodeJson($test->contentCovered, []),
+            'createdAt' => $test->createdAt,
+            'updatedAt' => $test->updatedAt,
+            'folders' => $folders,
+            'createdBy' => $createdBy,
+            'class' => $this->classView($test->classId),
+            'section' => $this->sectionView($test->sectionId),
+            'sourceFiles' => $this->sourceFiles($test->id),
+        ];
+    }
+
+    private function classView(?string $classId): ?array
+    {
+        if (!$classId) {
+            return null;
+        }
+        $class = DB::table('classes')->where('id', $classId)->first();
+        return $class ? [
+            'id' => $class->id,
+            'schoolId' => $class->school_id,
+            'numericLevel' => $class->numeric_level,
+            'displayName' => $class->display_name,
+            'createdAt' => $class->created_at,
+            'updatedAt' => $class->updated_at,
+        ] : null;
+    }
+
+    private function sectionView(?string $sectionId): ?array
+    {
+        if (!$sectionId) {
+            return null;
+        }
+        $section = DB::table('sections')->where('id', $sectionId)->first();
+        return $section ? [
+            'id' => $section->id,
+            'classId' => $section->class_id,
+            'name' => $section->name,
+            'capacity' => $section->capacity,
+            'createdAt' => $section->created_at,
+            'updatedAt' => $section->updated_at,
+        ] : null;
+    }
+
+    private function sourceFiles(string $testId): array
+    {
+        return DB::table('test_source_files')->where('test_id', $testId)->orderBy('created_at')
+            ->get(['id', 'test_id', 'original_name', 'mime_type', 'size_bytes', 'storage_key', 'created_at'])
+            ->map(fn (object $file): array => [
+                'id' => $file->id,
+                'originalName' => $file->original_name,
+                'mimeType' => $file->mime_type,
+                'sizeBytes' => $file->size_bytes,
+                'storageKey' => $file->storage_key,
+                'createdAt' => $file->created_at,
+            ])->all();
+    }
+
+    private function decodeJson(mixed $value, array $default): array
+    {
+        if (is_array($value)) {
+            return $value;
+        }
+        if (!is_string($value) || $value === '') {
+            return $default;
+        }
+        $decoded = json_decode($value, true);
+        return is_array($decoded) ? $decoded : $default;
+    }
+}
