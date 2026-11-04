@@ -28,36 +28,27 @@ class AiNotebookController
     ) {
     }
 
-    public function folders(Request $request): JsonResponse
+    public function subjects(Request $request): JsonResponse
     {
         $identity = $this->identity($request);
-        $query = DB::table('folders');
-        if (!$this->canManageSources($identity)) {
-            $query->whereExists(function ($permissions) use ($identity): void {
-                $permissions->selectRaw('1')
-                    ->from('folder_permissions')
-                    ->whereColumn('folder_permissions.folderId', 'folders.id')
-                    ->where('folder_permissions.userId', $identity['userId'])
-                    ->where('folder_permissions.canView', true)
-                    ->where('folder_permissions.billing_suspended', false);
-            });
+        $query = DB::table('subjects');
+        if (($identity['role'] ?? null) === 'student') {
+            $query->join('subject_user_access', 'subject_user_access.subject_id', '=', 'subjects.id')
+                ->where('subject_user_access.user_id', $identity['userId']);
         }
 
-        return response()->json($query->orderBy('name')->get([
-            'id',
-            'name',
-            'description',
-            'subject_id as subjectId',
-            'createdAt',
-            'updatedAt',
+        return response()->json($query->orderBy('subjects.name')->get([
+            'subjects.id',
+            'subjects.name',
+            'subjects.code',
         ]));
     }
 
-    public function folderSources(Request $request, string $folderId): JsonResponse
+    public function subjectSources(Request $request, string $subjectId): JsonResponse
     {
-        $this->ensureFolderAccessible($request, $folderId);
+        $this->ensureSubjectAccessible($request, $subjectId);
         $sources = DB::table('ai_notebook_sources')
-            ->where('folder_id', $folderId)
+            ->where('subject_id', $subjectId)
             ->orderByDesc('created_at')
             ->get();
 
@@ -67,12 +58,12 @@ class AiNotebookController
     public function storeSource(Request $request): JsonResponse
     {
         $input = $request->validate([
-            'folderId' => ['required', 'uuid'],
+            'subjectId' => ['required', 'uuid'],
             'title' => ['sometimes', 'nullable', 'string', 'max:255'],
             'file' => ['required', 'file', 'mimes:pdf,docx,txt', 'max:102400'],
         ]);
-        $folderId = $input['folderId'];
-        $this->ensureFolderAccessible($request, $folderId, true);
+        $subjectId = $input['subjectId'];
+        $this->ensureSubjectAccessible($request, $subjectId, true);
         $file = $request->file('file');
         if (!$file) {
             return response()->json(['message' => 'A source file is required.'], 422);
@@ -93,13 +84,18 @@ class AiNotebookController
         if (count($chunks) > 5000) {
             return response()->json(['message' => 'The document is too large to index safely.'], 422);
         }
+        if (!$this->embeddingsConfigured()) {
+            return response()->json([
+                'message' => 'OpenRouter embeddings are not fully configured. Set the embeddings API key, model, and dimensions before uploading sources.',
+            ], 503);
+        }
 
         $id = (string) Str::uuid();
         $storageKey = $this->storage->store($file, 'ai-notebook');
         $now = now();
         DB::table('ai_notebook_sources')->insert([
             'id' => $id,
-            'folder_id' => $folderId,
+            'subject_id' => $subjectId,
             'title' => trim((string) ($input['title'] ?? '')) ?: $file->getClientOriginalName(),
             'original_name' => $file->getClientOriginalName(),
             'mime_type' => $file->getMimeType() ?: 'application/octet-stream',
@@ -114,14 +110,12 @@ class AiNotebookController
         try {
             $vectorsByChunk = [];
             $modelByChunk = [];
-            if ($this->embeddingsConfigured()) {
-                foreach (array_chunk($chunks, 64) as $batchIndex => $batch) {
-                    $embedded = $this->embeddings->embed($batch);
-                    foreach ($embedded['embeddings'] as $index => $vector) {
-                        $chunkIndex = $batchIndex * 64 + $index;
-                        $vectorsByChunk[$chunkIndex] = $vector;
-                        $modelByChunk[$chunkIndex] = $embedded['model'];
-                    }
+            foreach (array_chunk($chunks, 64) as $batchIndex => $batch) {
+                $embedded = $this->embeddings->embed($batch);
+                foreach ($embedded['embeddings'] as $index => $vector) {
+                    $chunkIndex = $batchIndex * 64 + $index;
+                    $vectorsByChunk[$chunkIndex] = $vector;
+                    $modelByChunk[$chunkIndex] = $embedded['model'];
                 }
             }
 
@@ -132,8 +126,8 @@ class AiNotebookController
                         'source_id' => $id,
                         'ordinal' => $index,
                         'content' => $content,
-                        'embedding' => json_encode($vectorsByChunk[$index] ?? [], JSON_THROW_ON_ERROR),
-                        'embedding_model' => $modelByChunk[$index] ?? 'lexical',
+                        'embedding' => json_encode($vectorsByChunk[$index], JSON_THROW_ON_ERROR),
+                        'embedding_model' => $modelByChunk[$index],
                         'created_at' => now(),
                     ]);
                 }
@@ -163,7 +157,7 @@ class AiNotebookController
         if (!$source) {
             throw new NotFoundHttpException('Notebook source not found.');
         }
-        $this->ensureFolderAccessible($request, $source->folder_id, true);
+        $this->ensureSubjectAccessible($request, $source->subject_id, true);
         $this->storage->delete($source->storage_key);
         DB::table('ai_notebook_sources')->where('id', $id)->delete();
 
@@ -175,16 +169,24 @@ class AiNotebookController
         $identity = $this->identity($request);
         $query = DB::table('ai_notebook_chat_sessions')
             ->where('user_id', $identity['userId']);
-        $folderId = (string) $request->query('folderId', '');
-        if ($folderId !== '') {
-            $this->ensureFolderAccessible($request, $folderId);
-            $query->where('folder_id', $folderId);
+        if (($identity['role'] ?? null) === 'student') {
+            $query->whereExists(function ($access): void {
+                $access->select(DB::raw(1))
+                    ->from('subject_user_access')
+                    ->whereColumn('subject_user_access.subject_id', 'ai_notebook_chat_sessions.subject_id')
+                    ->whereColumn('subject_user_access.user_id', 'ai_notebook_chat_sessions.user_id');
+            });
+        }
+        $subjectId = (string) $request->query('subjectId', '');
+        if ($subjectId !== '') {
+            $this->ensureSubjectAccessible($request, $subjectId);
+            $query->where('subject_id', $subjectId);
         }
 
         return response()->json($query->orderByDesc('updated_at')->get()->map(
             static fn (object $session): array => [
                 'id' => $session->id,
-                'folderId' => $session->folder_id,
+                'subjectId' => $session->subject_id,
                 'title' => $session->title,
                 'createdAt' => $session->created_at,
                 'updatedAt' => $session->updated_at,
@@ -195,14 +197,14 @@ class AiNotebookController
     public function chat(Request $request): JsonResponse
     {
         $input = $request->validate([
-            'folderId' => ['required', 'uuid'],
+            'subjectId' => ['required', 'uuid'],
             'question' => ['required', 'string', 'min:1', 'max:4000'],
             'sessionId' => ['sometimes', 'uuid'],
             'studyAidMode' => ['sometimes', 'nullable', 'in:summary,mind_map'],
         ]);
         $identity = $this->identity($request);
-        $folderId = $input['folderId'];
-        $this->ensureFolderAccessible($request, $folderId);
+        $subjectId = $input['subjectId'];
+        $this->ensureSubjectAccessible($request, $subjectId);
         $sessionId = $input['sessionId'] ?? null;
         $session = $sessionId === null
             ? null
@@ -210,22 +212,24 @@ class AiNotebookController
                 ->where('id', $sessionId)
                 ->where('user_id', $identity['userId'])
                 ->first();
-        if ($sessionId !== null && (!$session || $session->folder_id !== $folderId)) {
+        if ($sessionId !== null && (!$session || $session->subject_id !== $subjectId)) {
             throw new NotFoundHttpException('Notebook session not found.');
         }
 
         $this->recordUsage($identity['userId']);
-        $retrieved = $this->retrieveChunks($folderId, $input['question']);
-        $folder = DB::table('folders')->where('id', $folderId)->first();
-        $defaultPrompt = DB::table('ai_notebook_prompts')->where('folder_id', $folderId)->first();
+        $retrieved = $this->retrieveChunks($subjectId, $input['question']);
+        $subject = DB::table('subjects')->where('id', $subjectId)->first();
+        $defaultPrompt = DB::table('ai_notebook_prompts')->where('subject_id', $subjectId)->first();
         $personalPrompt = DB::table('ai_notebook_user_prompts')
-            ->where('folder_id', $folderId)
+            ->where('subject_id', $subjectId)
             ->where('user_id', $identity['userId'])
             ->first();
         $prompt = $personalPrompt?->prompt ?: ($defaultPrompt?->prompt ?? '');
-        $language = $defaultPrompt?->response_language ?? 'english';
+        $language = $personalPrompt?->response_language
+            ?? $defaultPrompt?->response_language
+            ?? 'english';
         $instructions = trim(
-            'You are a subject-specific learning assistant for '.($folder->name ?? 'the selected subject').'. '.
+            'You are a subject-specific learning assistant for '.($subject->name ?? 'the selected subject').'. '.
             'Answer accurately using the supplied source excerpts. If they do not contain the answer, say so plainly. '.
             'Do not invent citations. Respond in '.str_replace('_', ' ', $language).'. '.
             $prompt
@@ -269,11 +273,11 @@ class AiNotebookController
 
         $sessionId ??= (string) Str::uuid();
         $now = now();
-        DB::transaction(function () use ($session, $sessionId, $folderId, $identity, $input, $answer, $retrieved, $now): void {
+        DB::transaction(function () use ($session, $sessionId, $subjectId, $identity, $input, $answer, $retrieved, $now): void {
             if ($session === null) {
                 DB::table('ai_notebook_chat_sessions')->insert([
                     'id' => $sessionId,
-                    'folder_id' => $folderId,
+                    'subject_id' => $subjectId,
                     'user_id' => $identity['userId'],
                     'title' => Str::limit($input['question'], 120, ''),
                     'created_at' => $now,
@@ -330,6 +334,7 @@ class AiNotebookController
         if (!$session) {
             throw new NotFoundHttpException('Notebook session not found.');
         }
+        $this->ensureSubjectAccessible($request, $session->subject_id);
 
         $messages = DB::table('ai_notebook_chat_messages')
             ->where('session_id', $id)
@@ -338,7 +343,7 @@ class AiNotebookController
 
         return response()->json([
             'id' => $session->id,
-            'folderId' => $session->folder_id,
+            'subjectId' => $session->subject_id,
             'title' => $session->title,
             'createdAt' => $session->created_at,
             'updatedAt' => $session->updated_at,
@@ -354,54 +359,85 @@ class AiNotebookController
 
     public function deleteSession(Request $request, string $id): JsonResponse
     {
-        $deleted = DB::table('ai_notebook_chat_sessions')
+        $session = DB::table('ai_notebook_chat_sessions')
             ->where('id', $id)
             ->where('user_id', $this->identity($request)['userId'])
-            ->delete();
-        if (!$deleted) {
+            ->first();
+        if (!$session) {
             throw new NotFoundHttpException('Notebook session not found.');
         }
+        $this->ensureSubjectAccessible($request, $session->subject_id);
+        DB::table('ai_notebook_chat_sessions')->where('id', $id)->delete();
 
         return response()->json(['ok' => true]);
     }
 
-    public function prompt(Request $request, string $folderId): JsonResponse
+    public function prompt(Request $request, string $subjectId): JsonResponse
     {
-        $this->ensureFolderAccessible($request, $folderId);
-        $default = DB::table('ai_notebook_prompts')->where('folder_id', $folderId)->first();
+        $this->ensureSubjectAccessible($request, $subjectId);
+        $default = DB::table('ai_notebook_prompts')->where('subject_id', $subjectId)->first();
         $personal = DB::table('ai_notebook_user_prompts')
-            ->where('folder_id', $folderId)
+            ->where('subject_id', $subjectId)
             ->where('user_id', $this->identity($request)['userId'])
             ->first();
 
         return response()->json([
-            'folderId' => $folderId,
-            'prompt' => $default?->prompt ?? '',
-            'responseLanguage' => $default?->response_language ?? 'english',
+            'subjectId' => $subjectId,
+            'prompt' => $personal?->prompt ?: ($default?->prompt ?? ''),
+            'responseLanguage' => $personal?->response_language
+                ?? $default?->response_language
+                ?? 'english',
+            'defaultPrompt' => $default?->prompt ?? '',
+            'defaultResponseLanguage' => $default?->response_language ?? 'english',
             'personalPrompt' => $personal?->prompt,
         ]);
     }
 
-    public function savePrompt(Request $request, string $folderId): JsonResponse
+    public function savePersonalPrompt(Request $request, string $subjectId): JsonResponse
     {
-        $this->ensureFolderAccessible($request, $folderId, true);
+        $this->ensureSubjectAccessible($request, $subjectId);
+        $input = $request->validate([
+            'prompt' => ['required', 'string', 'max:4000'],
+            'responseLanguage' => ['required', 'string', 'in:english,urdu,roman_urdu'],
+        ]);
+        $userId = $this->identity($request)['userId'];
+        $payload = [
+            'prompt' => $input['prompt'],
+            'response_language' => $input['responseLanguage'],
+            'updated_at' => now(),
+        ];
+        DB::table('ai_notebook_user_prompts')->updateOrInsert(
+            ['subject_id' => $subjectId, 'user_id' => $userId],
+            ['subject_id' => $subjectId, 'user_id' => $userId, ...$payload]
+        );
+
+        return response()->json([
+            'subjectId' => $subjectId,
+            'prompt' => $payload['prompt'],
+            'responseLanguage' => $payload['response_language'],
+        ]);
+    }
+
+    public function savePrompt(Request $request, string $subjectId): JsonResponse
+    {
+        $this->ensureSubjectAccessible($request, $subjectId, true);
         $input = $request->validate([
             'prompt' => ['required', 'string', 'max:4000'],
             'responseLanguage' => ['sometimes', 'string', 'in:english,urdu,roman_urdu'],
         ]);
         $payload = [
-            'folder_id' => $folderId,
+            'subject_id' => $subjectId,
             'prompt' => $input['prompt'],
             'response_language' => $input['responseLanguage'] ?? 'english',
             'updated_at' => now(),
         ];
         DB::table('ai_notebook_prompts')->updateOrInsert(
-            ['folder_id' => $folderId],
+            ['subject_id' => $subjectId],
             $payload
         );
 
         return response()->json([
-            'folderId' => $folderId,
+            'subjectId' => $subjectId,
             'prompt' => $payload['prompt'],
             'responseLanguage' => $payload['response_language'],
         ]);
@@ -419,7 +455,7 @@ class AiNotebookController
 
         return [
             'id' => $source->id,
-            'folderId' => $source->folder_id,
+            'subjectId' => $source->subject_id,
             'title' => $source->title,
             'originalName' => $source->original_name,
             'mimeType' => $source->mime_type,
@@ -479,11 +515,11 @@ class AiNotebookController
         return $chunks;
     }
 
-    private function retrieveChunks(string $folderId, string $question): array
+    private function retrieveChunks(string $subjectId, string $question): array
     {
         $rows = DB::table('ai_notebook_chunks as chunk')
             ->join('ai_notebook_sources as source', 'source.id', '=', 'chunk.source_id')
-            ->where('source.folder_id', $folderId)
+            ->where('source.subject_id', $subjectId)
             ->where('source.status', 'ready')
             ->get([
                 'chunk.id',
@@ -606,27 +642,27 @@ class AiNotebookController
     {
         return ($identity['role'] ?? null) === 'admin' ||
             in_array('admin', $identity['adminPermissions'] ?? [], true) ||
-            in_array('folder_manager', $identity['adminPermissions'] ?? [], true);
+            in_array('teacher_assistant', $identity['adminPermissions'] ?? [], true);
     }
 
-    private function ensureFolderAccessible(Request $request, string $folderId, bool $requireManager = false): void
+    private function ensureSubjectAccessible(Request $request, string $subjectId, bool $requireManager = false): void
     {
-        if (!Str::isUuid($folderId)) {
-            abort(400, 'Invalid folder identifier.');
+        if (!Str::isUuid($subjectId)) {
+            abort(400, 'Invalid subject identifier.');
         }
-        if (!DB::table('folders')->where('id', $folderId)->exists()) {
-            throw new NotFoundHttpException('Subject folder not found.');
+        if (!DB::table('subjects')->where('id', $subjectId)->exists()) {
+            throw new NotFoundHttpException('Subject not found.');
         }
         $identity = $this->identity($request);
         if ($requireManager && !$this->canManageSources($identity)) {
-            throw new AccessDeniedHttpException('Folder management permission is required.');
+            throw new AccessDeniedHttpException('Notebook management permission is required.');
         }
-        if (!$this->canManageSources($identity) && !DB::table('folder_permissions')
-            ->where('folderId', $folderId)
-            ->where('userId', $identity['userId'])
-            ->where('canView', true)
-            ->where('billing_suspended', false)
-            ->exists()) {
+        if (!$this->canManageSources($identity) &&
+            ($identity['role'] ?? null) === 'student' &&
+            !DB::table('subject_user_access')
+                ->where('subject_id', $subjectId)
+                ->where('user_id', $identity['userId'])
+                ->exists()) {
             throw new AccessDeniedHttpException('You do not have access to this subject.');
         }
     }

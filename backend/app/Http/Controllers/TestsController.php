@@ -3,7 +3,9 @@
 namespace App\Http\Controllers;
 
 use App\Services\QuestionPreviewService;
+use App\Services\PrivateFileStorage;
 use App\Services\TestAuthoringService;
+use App\Services\TestAssessmentService;
 use App\Services\TestStudentAccessService;
 use App\Services\TestSubmissionService;
 use Illuminate\Http\JsonResponse;
@@ -13,12 +15,14 @@ use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 
 class TestsController
 {
     public function __construct(
         private readonly TestAuthoringService $tests,
+        private readonly TestAssessmentService $assessment,
         private readonly QuestionPreviewService $preview,
         private readonly TestStudentAccessService $studentAccess,
         private readonly TestSubmissionService $submissions
@@ -77,13 +81,13 @@ class TestsController
         ), 201);
     }
 
-    public function resubmit(Request $request, string $id, string $attemptId): never
+    public function resubmit(Request $request, string $id, string $attemptId): JsonResponse
     {
-        $this->submissions->resubmit(
+        return response()->json($this->submissions->resubmit(
             $id,
             $attemptId,
             (string) $request->attributes->get('apiIdentity')['userId']
-        );
+        ));
     }
 
     public function index(): JsonResponse
@@ -166,17 +170,6 @@ class TestsController
         if (!$test || !$student) {
             return response()->json(['message' => 'Test or student not found.'], 404);
         }
-        $hasFolderAccess = DB::table('test_folders as test_folder')
-            ->join('folder_permissions as permission', 'permission.folderId', '=', 'test_folder.folderId')
-            ->where('test_folder.testId', $testId)
-            ->where('permission.userId', $studentId)
-            ->where('permission.canView', true)
-            ->where('permission.billing_suspended', false)
-            ->exists();
-        if (!$hasFolderAccess) {
-            return response()->json(['message' => 'The student does not have active access to this test.'], 403);
-        }
-
         $deadline = \Illuminate\Support\Carbon::parse($input['deadlineAt']);
         if (!$deadline->isFuture() ||
             ($test->deadline_at !== null && $deadline->lessThan(\Illuminate\Support\Carbon::parse($test->deadline_at)))) {
@@ -224,26 +217,97 @@ class TestsController
 
         return response()->json([
             'deficiencyReportPrompt' => $setting?->deficiency_report_prompt ?? '',
+            'resultReleaseDelayHours' => (int) ($setting?->result_release_delay_hours ?? 24),
         ]);
     }
 
     public function saveGradingSettings(Request $request): JsonResponse
     {
         $input = $request->validate([
-            'deficiencyReportPrompt' => ['required', 'string', 'max:4000'],
+            'deficiencyReportPrompt' => ['nullable', 'string', 'max:4000'],
+            'resultReleaseDelayHours' => ['required', 'integer', 'min:0', 'max:720'],
         ]);
         $payload = [
-            'deficiencyReportPrompt' => $input['deficiencyReportPrompt'],
+            'deficiencyReportPrompt' => $input['deficiencyReportPrompt'] ?? '',
+            'resultReleaseDelayHours' => (int) $input['resultReleaseDelayHours'],
         ];
         DB::table('ai_grading_settings')->updateOrInsert(
             ['id' => 1],
             [
                 'deficiency_report_prompt' => $payload['deficiencyReportPrompt'],
+                'result_release_delay_hours' => $payload['resultReleaseDelayHours'],
                 'updated_at' => now(),
             ]
         );
 
         return response()->json($payload);
+    }
+
+    public function attempts(string $testId): JsonResponse
+    {
+        return response()->json($this->assessment->listAttempts($testId));
+    }
+
+    public function retryAssessment(string $testId, string $attemptId): JsonResponse
+    {
+        try {
+            return response()->json($this->assessment->gradeAttempt($testId, $attemptId));
+        } catch (\RuntimeException $error) {
+            return response()->json(['message' => $error->getMessage()], 503);
+        }
+    }
+
+    public function downloadAttemptFile(string $testId, string $fileId, PrivateFileStorage $storage): JsonResponse|StreamedResponse
+    {
+        $file = DB::table('test_attempt_files as file')
+            ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
+            ->where('attempt.testId', $testId)
+            ->where('file.id', $fileId)
+            ->first(['file.storage_key', 'file.original_name', 'file.mime_type']);
+        if (!$file || !is_string($file->storage_key)) {
+            return response()->json(['message' => 'Submission file not found.'], 404);
+        }
+
+        try {
+            $path = $storage->resolve($file->storage_key);
+        } catch (\RuntimeException) {
+            return response()->json(['message' => 'Submission file is unavailable.'], 404);
+        }
+        if (!is_file($path)) {
+            return response()->json(['message' => 'Submission file is unavailable.'], 404);
+        }
+
+        return response()->streamDownload(
+            static function () use ($path): void {
+                $stream = fopen($path, 'rb');
+                if ($stream === false) {
+                    return;
+                }
+                fpassthru($stream);
+                fclose($stream);
+            },
+            $file->original_name,
+            [
+                'Content-Type' => $file->mime_type ?: 'application/octet-stream',
+                'Cache-Control' => 'private, no-store',
+                'X-Content-Type-Options' => 'nosniff',
+            ],
+            'attachment'
+        );
+    }
+
+    public function updateMarks(Request $request, string $testId, string $studentId): JsonResponse
+    {
+        $input = $request->validate([
+            'marksObtained' => ['sometimes', 'numeric', 'decimal:0,2', 'min:0', 'max:10000'],
+            'deficiencyNotes' => ['sometimes', 'nullable', 'string', 'max:4000'],
+            'reviewResolution' => ['sometimes', 'nullable', 'string', 'max:4000'],
+        ]);
+        if ($input === []) {
+            return response()->json(['message' => 'Provide marks or a review response to save.'], 422);
+        }
+
+        return response()->json($this->assessment->updateMarks($testId, $studentId, $input));
     }
 
     private function validateBody(Request $request): array
@@ -254,12 +318,7 @@ class TestsController
             'testDate' => ['sometimes', 'nullable', 'date'],
             'deadlineAt' => ['sometimes', 'nullable', 'date'],
             'totalMarks' => ['required', 'numeric', 'decimal:0,2', 'min:0.01', 'max:10000'],
-            'classId' => ['sometimes', 'nullable', 'regex:/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'],
-            'sectionId' => ['sometimes', 'nullable', 'regex:/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'],
-            'folderIds' => ['sometimes', 'array', 'max:50'],
-            'folderIds.*' => ['required', 'distinct', 'regex:/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'],
-            'contentCovered' => ['sometimes', 'array', 'max:500'],
-            'contentCovered.*' => ['required', 'distinct', 'regex:/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'],
+            'subjectId' => ['required', 'uuid:4', 'exists:subjects,id'],
             'questions' => ['required', 'array', 'min:1', 'max:100'],
             'questions.*' => ['required', 'array:questionNumber,questionText,idealAnswer,difficulty,questionSourceLocations,solutionSourceLocations,marks,markingScheme'],
             'questions.*.questionNumber' => ['required', 'integer', 'min:1', 'max:100'],
@@ -286,7 +345,7 @@ class TestsController
         $validator = Validator::make($request->all(), $rules);
         $validator->after(function ($validator) use ($request): void {
             foreach (array_keys($request->all()) as $key) {
-                if (!in_array($key, ['title', 'description', 'testDate', 'deadlineAt', 'totalMarks', 'classId', 'sectionId', 'folderIds', 'contentCovered', 'questions'], true)) {
+                if (!in_array($key, ['title', 'description', 'testDate', 'deadlineAt', 'totalMarks', 'subjectId', 'questions'], true)) {
                     $validator->errors()->add($key, 'The field is not allowed.');
                 }
             }

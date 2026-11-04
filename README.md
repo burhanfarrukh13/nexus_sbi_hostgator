@@ -1,66 +1,42 @@
-# Nexus SBI — HostGator deployment copy
+# Nexus SBI — HostGator build
 
-This directory is an isolated deployment branch for the supplied HostGator Business target. The original NestJS/PostgreSQL backend remains read-only and was not copied. The React/Vite source is copied for off-host static builds. A Laravel 12/PHP API is started here, but this is **not a full application port**; see [`docs/API-COMPATIBILITY.md`](docs/API-COMPATIBILITY.md) and [`docs/HOSTGATOR-DEPLOYMENT.md`](docs/HOSTGATOR-DEPLOYMENT.md) before use.
+This isolated copy targets PHP/Laravel and MySQL on HostGator Business. It retains authentication/account administration, standalone subjects, tests, and AI Notebook. The React/Vite frontend is built as static files; production does not require Node.js. PDF test submissions are rendered to page images in the browser and graded asynchronously by the configured vision-capable Ollama model using a cPanel cron job. Changes belong only in `D:\claude\nexus_sbi_hostgator`; the original `D:\claude\nexus_sbi` remains untouched.
 
-Runtime validation note: the build is intentionally structured for HostGator + MySQL, but a real PHP 8.2+/Composer runtime and actual HostGator or Laragon database credentials are still required before live deployment can be certified. The included `scripts/verify-hostgator-runtime.ps1` helper checks whether the local environment has the required PHP extensions before running Laravel or Composer commands.
+The intentionally removed features and current route contracts are listed in [`docs/API-COMPATIBILITY.md`](docs/API-COMPATIBILITY.md). Typed/selectable-text test answers are assessed synchronously through Ollama; photos and scanned PDF pages are graded by a background cPanel cron job. Marks are hidden until the configured delay (24 hours by default). Notebook chat/grading and indexing require configured cloud APIs. Set the backend Ollama endpoint to `https://ollama.com/v1/chat/completions`; set OpenRouter embeddings to `openai/text-embedding-3-small` with 1536 dimensions. Do not copy API keys into the frontend.
 
-## Current implementation
+## Database
 
-Implemented API slice:
+The schema is in `database.sql`; it creates only the authentication, audit, subject, test/attempt/file, AI Notebook, and grading-settings tables. It contains no production records, sample users, or initial admin. The import script drops and recreates its declared tables, including `users`; back up first because it erases existing accounts and application data in those tables.
 
-- `GET /api/health`
-- `POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/auth/signout`, `GET /api/auth/me`, and `POST /api/auth/change-password`
-- Team member list/create/permission replacement/password reset at `GET/POST /api/team-members` and `PUT /api/team-members/{userId}/permissions|password`
-- School listing and creation at `GET /api/school/list` and `POST /api/school`
-- Subject list/create/update/class mapping/teacher assignment at `GET /api/subjects/list`, `POST /api/subjects`, `PUT /api/subjects/{id}`, and the two `POST /api/subjects/{id}/...` routes
-- Student list/get/create/update/class assignment/archive/permanent deletion at `/api/students`
-- Student query create/list/get/reply at `/api/student-queries`, with owner restrictions and admin query-handler permissions
-- Authenticated privacy-preserving rankings at `GET /api/leaderboard`
-- User list/create/exact-email lookup/partial-email search at `/api/users`, including role scoping and active-device search results
-- All eight admin analytics routes at `/api/admin/analytics` (overview, filters, students, student detail, questions, topics, quizzes, and activity), with cohort/date/content filters and role authorization
-- Test list/create authoring at `GET/POST /api/tests`, plus student access and attempt discovery at `GET /api/tests/me/attempts`, `GET /api/tests/{id}/me`, and `POST /api/tests/{id}/me/request-access`; student submission persists answers and private upload metadata, but grading is unavailable and valid resubmission fails closed with 503. Do not use student assessments in production. Question-import preview lacks OCR and full source answer-key analysis.
-- Folder list/create/update/delete, permission grant/revocation/listing, and per-user authorized listing; multipart cover upload/clear routes are not ported
-- Authenticated, user-bound signed private-file downloads at `GET /api/storage/file`
-- MySQL identity/session, audit, school-year, student/cohort/license, subject/class/section/container, lecture-relation, folder-permission/student-delete dependency, test-authoring/list-relation, and student-attempt/file-metadata migrations; a one-time initial-admin CLI command; an OpenAI-compatible configurable cloud-embedding client; and private storage primitives
+For Laragon/phpMyAdmin:
 
-The inventory contains 94 source controller operations including `GET /api/health`: 55 operations are fully implemented (54 application routes plus health); preview, submission, and resubmission are partial, leaving 39 incomplete operations (36 unported plus three partial). These are source-derived slices with feature tests authored but not executed, not application parity. PHP/Composer are unavailable in this environment, so Laravel tests cannot run. Submission writes remain pending because the source assessment/grading engine and recovery worker are not ported; do not enable student assessments or cut over the React client to this partial API.
+1. Create/select an empty database such as `nexus_sbi_local`.
+2. Select that database, then import `database.sql`.
+3. Configure `backend/.env` for the same database.
+4. Configure the provider credentials and model settings in `backend/.env`; after changing them run `php artisan config:clear`. Existing Notebook sources uploaded before embedding credentials were ready need one-time reindexing with `php artisan ai-notebook:reindex-embeddings`.
+5. Do **not** run `php artisan migrate` after the SQL import: Laravel will see no migration-history table and try to create tables that already exist. On a fresh database, choose either the SQL import or `php artisan migrate`, not both.
+6. Create the first admin using the documented `php artisan nexus:admin-create` command after backend dependencies and environment are configured.
 
-## Build and local validation
+`database.sql` does not select/create the database. If switching databases, import only into the intended empty target and use the explicit admin-creation command; never copy database contents from the original project.
 
-Requirements are PHP 8.2+, Composer 2, PDO MySQL (and PDO SQLite for tests), and the PHP extensions listed in `backend/composer.json`.
+## Local checks
+
+Backend, from `backend` (PHP 8.2+, Composer, and PDO SQLite/MySQL required):
 
 ```powershell
-cd backend
-composer update
-composer validate
+composer install
 Copy-Item .env.example .env
 php artisan key:generate
-php artisan test
+vendor\bin\phpunit
 ```
 
-`composer.lock` is intentionally absent because Composer and PHP are not installed in the implementation environment. Resolve dependencies on the build machine, inspect and commit the resulting lockfile, then deploy `vendor/` with the PHP application. Never copy `.env` from another environment.
-
-Build the static site off-host:
+Frontend, from `web` (Node.js is needed only for development/build):
 
 ```powershell
-cd web
 npm ci
-$env:VITE_API_BASE_URL = "https://api.example.com"
+$env:VITE_API_BASE_URL = 'http://localhost:8000'
 npm run typecheck
 npm run build
 ```
 
-Deploy `web/dist` to the static site's document root. This is build-time configuration only; never put API keys or backend secrets in `VITE_*` variables.
-
-HostGator packaging helper:
-
-```powershell
-cd scripts
-.\prepare-hostgator-package.ps1
-```
-
-The helper prepares a deployment bundle from the HostGator API and static web build without touching the source project at `D:\claude\nexus_sbi`.
-
-## Do not deploy yet
-
-The HostGator PHP version/extensions, MySQL release, outbound HTTPS support, and account limits remain unverified. The identity, audit, school, subject, and folder-related migrations are not the complete source schema; class and section tables currently support the subject domain but have no source-equivalent management routes, and the folder-access-plan table is only a billing-history delete guard. There are no production credentials, database records, uploads, sample seeds, or database dumps in this copy.
+Serve `backend/public` as the API document root and `web/dist` as the static site. Review [`docs/HOSTGATOR-DEPLOYMENT.md`](docs/HOSTGATOR-DEPLOYMENT.md) before deployment. HostGator's actual PHP extensions, MySQL version, HTTPS egress, storage limits, and account configuration have not been verified.

@@ -2,16 +2,16 @@
 
 return [
     'embeddings' => [
-        'url' => env('EMBEDDINGS_API_URL'),
-        'key' => env('EMBEDDINGS_API_KEY'),
-        'model' => env('EMBEDDINGS_MODEL'),
-        'dimensions' => env('EMBEDDINGS_DIMENSIONS'),
-        'timeout' => (int) env('EMBEDDINGS_TIMEOUT_SECONDS', 30),
+        'url' => env('OPENROUTER_EMBEDDINGS_API_URL', 'https://openrouter.ai/api/v1/embeddings'),
+        'key' => env('OPENROUTER_API_KEY'),
+        'model' => env('OPENROUTER_EMBEDDINGS_MODEL'),
+        'dimensions' => env('OPENROUTER_EMBEDDINGS_DIMENSIONS'),
+        'timeout' => (int) env('OPENROUTER_TIMEOUT_SECONDS', 30),
     ],
     'ai_chat' => [
-        'url' => env('AI_CHAT_API_URL'),
-        'key' => env('AI_CHAT_API_KEY'),
-        'model' => env('AI_CHAT_MODEL'),
-        'timeout' => (int) env('AI_CHAT_TIMEOUT_SECONDS', 45),
+        'url' => env('OLLAMA_API_URL', 'https://ollama.com/v1/chat/completions'),
+        'key' => env('OLLAMA_API_KEY'),
+        'model' => env('OLLAMA_MODEL'),
+        'timeout' => (int) env('OLLAMA_TIMEOUT_SECONDS', 90),
     ],
 ];

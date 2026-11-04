@@ -17,27 +17,26 @@ class SubjectsController
 
     public function index(Request $request): JsonResponse
     {
+        $identity = (array) $request->attributes->get('apiIdentity');
+        $isAdmin = ($identity['role'] ?? null) === 'admin' ||
+            in_array('admin', $identity['adminPermissions'] ?? [], true);
+
         return response()->json($this->subjects->list(
-            $request->query('schoolId'),
-            $request->query('classId'),
-            $request->query('sectionId')
+            $identity['userId'] ?? null,
+            $isAdmin
         ));
     }
 
     public function store(Request $request): JsonResponse
     {
         $input = $this->validateRequest($request, [
-            'schoolId' => ['required', 'uuid'],
             'code' => ['required', 'string', 'min:1', 'max:32'],
             'name' => ['required', 'string', 'min:1', 'max:128'],
-            'classId' => ['sometimes', 'nullable', 'uuid'],
-            'sectionId' => ['sometimes', 'nullable', 'uuid'],
-            'defaultPrice' => ['sometimes', 'numeric', 'min:0', 'decimal:0,2'],
         ]);
 
         return response()->json($this->subjects->create(
             $input,
-            $request->attributes->get('apiIdentity')['userId']
+            (string) $request->attributes->get('apiIdentity')['userId']
         ), 201);
     }
 
@@ -45,43 +44,19 @@ class SubjectsController
     {
         $this->validateUuid($id);
         $input = $this->validateRequest($request, [
-            'code' => ['sometimes', 'nullable', 'string', 'min:1', 'max:32'],
-            'name' => ['sometimes', 'nullable', 'string', 'min:1', 'max:128'],
+            'code' => ['sometimes', 'required', 'string', 'min:1', 'max:32'],
+            'name' => ['sometimes', 'required', 'string', 'min:1', 'max:128'],
         ]);
 
-        return response()->json($this->subjects->update(
-            $id,
-            $input,
-            $request->attributes->get('apiIdentity')['userId']
-        ));
+        return response()->json($this->subjects->update($id, $input));
     }
 
-    public function mapToClass(Request $request, string $id): JsonResponse
+    public function destroy(string $id): JsonResponse
     {
         $this->validateUuid($id);
-        $input = $this->validateRequest($request, ['classId' => ['required', 'uuid']]);
+        $this->subjects->delete($id);
 
-        return response()->json($this->subjects->mapToClass(
-            $id,
-            $input['classId'],
-            $request->attributes->get('apiIdentity')['userId']
-        ), 201);
-    }
-
-    public function assignTeacher(Request $request, string $id): JsonResponse
-    {
-        $this->validateUuid($id);
-        $input = $this->validateRequest($request, [
-            'classId' => ['required', 'uuid'],
-            'sectionId' => ['sometimes', 'nullable', 'uuid'],
-            'userId' => ['required', 'uuid'],
-        ]);
-
-        return response()->json($this->subjects->assignTeacher(
-            $id,
-            $input,
-            $request->attributes->get('apiIdentity')['userId']
-        ), 201);
+        return response()->json(['success' => true]);
     }
 
     private function validateRequest(Request $request, array $rules): array

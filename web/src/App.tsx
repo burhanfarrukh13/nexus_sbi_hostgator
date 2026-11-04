@@ -35,11 +35,12 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
-  Trash2,
   Trophy,
   Users,
   X,
 } from "lucide-react";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {
   API_BASE,
   api,
@@ -51,6 +52,134 @@ import {
   subscribeToStudentDataUpdates,
   type StudentDataUpdate,
 } from "./api";
+
+GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+const MAX_ANSWER_PDF_PAGES = 30;
+const MAX_VISION_IMAGE_WIDTH = 1400;
+const MAX_VISION_IMAGE_BYTES = 350 * 1024;
+
+function canvasToJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) =>
+        blob
+          ? resolve(blob)
+          : reject(new Error("Could not encode an answer image.")),
+      "image/jpeg",
+      quality,
+    );
+  });
+}
+
+async function renderAnswerPdf(file: File, prefix: string): Promise<File[]> {
+  const pdf = await getDocument({
+    data: new Uint8Array(await file.arrayBuffer()),
+  }).promise;
+  try {
+    if (pdf.numPages < 1 || pdf.numPages > MAX_ANSWER_PDF_PAGES) {
+      throw new Error(
+        `Answer PDFs must contain 1 to ${MAX_ANSWER_PDF_PAGES} pages.`,
+      );
+    }
+
+    const pages: File[] = [];
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const originalViewport = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({
+        scale: Math.min(1, MAX_VISION_IMAGE_WIDTH / originalViewport.width),
+      });
+      const canvas = window.document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Could not prepare an answer PDF page.");
+      await page.render({ canvasContext: context, viewport }).promise;
+
+      let blob = await canvasToJpeg(canvas, 0.8);
+      let quality = 0.7;
+      while (blob.size > MAX_VISION_IMAGE_BYTES && quality >= 0.5) {
+        blob = await canvasToJpeg(canvas, quality);
+        quality -= 0.1;
+      }
+      if (blob.size > MAX_VISION_IMAGE_BYTES) {
+        throw new Error(
+          "A rendered PDF page is too large to submit. Use a lower-resolution scan.",
+        );
+      }
+      pages.push(
+        new File([blob], `${prefix}-page-${pageNumber}.jpg`, {
+          type: "image/jpeg",
+        }),
+      );
+      canvas.width = 0;
+      canvas.height = 0;
+      page.cleanup();
+    }
+    return pages;
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+async function compactAnswerImage(file: File, prefix: string): Promise<File> {
+  const image = await createImageBitmap(file);
+  try {
+    if (
+      image.width <= MAX_VISION_IMAGE_WIDTH &&
+      file.size <= MAX_VISION_IMAGE_BYTES
+    ) {
+      return new File([file], `${prefix}.${file.name.split(".").pop()}`, {
+        type: file.type,
+      });
+    }
+
+    const scale = Math.min(1, MAX_VISION_IMAGE_WIDTH / image.width);
+    const canvas = window.document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not prepare the answer image.");
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    let blob = await canvasToJpeg(canvas, 0.8);
+    let quality = 0.7;
+    while (blob.size > MAX_VISION_IMAGE_BYTES && quality >= 0.5) {
+      blob = await canvasToJpeg(canvas, quality);
+      quality -= 0.1;
+    }
+    if (blob.size > MAX_VISION_IMAGE_BYTES) {
+      throw new Error(
+        "An answer image is too large to submit. Use a lower-resolution photo.",
+      );
+    }
+    canvas.width = 0;
+    canvas.height = 0;
+    return new File([blob], `${prefix}.jpg`, { type: "image/jpeg" });
+  } finally {
+    image.close();
+  }
+}
+
+async function appendAnswerFile(
+  form: FormData,
+  file: File,
+  prefix: string,
+): Promise<void> {
+  if (file.name.toLowerCase().endsWith(".pdf")) {
+    for (const page of await renderAnswerPdf(file, prefix)) {
+      form.append("files", page, page.name);
+    }
+    return;
+  }
+  if (file.type.startsWith("image/")) {
+    const image = await compactAnswerImage(file, prefix);
+    form.append("files", image, image.name);
+    return;
+  }
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  form.append("files", file, `${prefix}.${extension}`);
+}
 import {
   clearTestAssetCache,
   getTestPageBlob,
@@ -109,7 +238,7 @@ const studentLinks: {
   { id: "notebook", title: "Notebook", icon: BookOpen },
   { id: "tests", title: "My Tests", icon: FileText },
   { id: "performers", title: "Top Performers", icon: Trophy },
-  { id: "contact", title: "Admin Contact", icon: MessageCircle },
+  { id: "contact", title: "Contact Support", icon: MessageCircle },
 ];
 const adminLinks: { id: Page; title: string; icon: typeof LayoutDashboard }[] =
   [
@@ -120,18 +249,17 @@ const adminLinks: { id: Page; title: string; icon: typeof LayoutDashboard }[] =
     { id: "students", title: "Students", icon: Users },
     { id: "users", title: "Users", icon: ShieldCheck },
     { id: "passwords", title: "Passwords", icon: ShieldCheck },
+    { id: "notebook", title: "AI Notebook", icon: BookOpen },
     { id: "queries", title: "Student Queries", icon: MessageCircle },
     { id: "analytics", title: "Analytics", icon: BarChart3 },
-    { id: "notebook", title: "AI Notebook", icon: BookOpen },
   ];
 const adminPermissionOptions = [
   ["admin", "Super admin (all permissions)"],
-  ["teacher_assistant", "Tests & marks"],
-  ["folder_manager", "Subjects and notebook content"],
-  ["user_manager", "Students and user access"],
+  ["teacher_assistant", "Tests and notebook content"],
+  ["user_manager", "User access"],
   ["password_manager", "Passwords"],
-  ["student_query", "Student queries"],
-  ["testing_manager", "Analytics and test content"],
+  ["testing_manager", "Test access and marks"],
+  ["student_query", "Student query inbox"],
 ] as const;
 const getId = (x: Data) => String(x.id ?? x.uuid ?? "");
 const getTitle = (x: Data) =>
@@ -168,6 +296,12 @@ function splitMarkdownTableRow(line: string): string[] | null {
     .replace(/\|$/, "")
     .split("|")
     .map((cell) => cell.replace(/\\\|/g, "|").trim());
+}
+
+function splitTabDelimitedRow(line: string): string[] | null {
+  if (!line.includes("\t")) return null;
+  const cells = line.split(/\t+/).map((cell) => cell.trim());
+  return cells.length >= 2 ? cells : null;
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {
@@ -208,6 +342,47 @@ function FormattedContent({
   for (let index = 0; index < lines.length; index += 1) {
     const trimmed = lines[index].trim();
     if (!trimmed) continue;
+
+    const firstTabRow = splitTabDelimitedRow(lines[index]);
+    if (firstTabRow) {
+      const tabRows = [firstTabRow];
+      let nextIndex = index + 1;
+      while (nextIndex < lines.length) {
+        const row = splitTabDelimitedRow(lines[nextIndex]);
+        if (!row) break;
+        tabRows.push(row);
+        nextIndex += 1;
+      }
+      if (
+        tabRows.length >= 2 &&
+        tabRows.every((row) => row.length === firstTabRow.length)
+      ) {
+        blocks.push(
+          <div className="formatted-table-wrap" key={`tab-table-${index}`}>
+            <table className="formatted-table">
+              <thead>
+                <tr>
+                  {firstTabRow.map((cell, cellIndex) => (
+                    <th key={cellIndex}>{renderInlineMarkdown(cell)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {tabRows.slice(1).map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {row.map((cell, cellIndex) => (
+                      <td key={cellIndex}>{renderInlineMarkdown(cell)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>,
+        );
+        index = nextIndex - 1;
+        continue;
+      }
+    }
 
     const codeFence = trimmed.match(/^```(\w*)\s*$/);
     if (codeFence) {
@@ -342,6 +517,18 @@ function FormattedContent({
           /^\*\*.+\*\*$/.test(nextLine) ||
           /^(?:[-*+]|\d+[.)])\s+/.test(nextLine) ||
           nextLine.startsWith(">")
+        ) {
+          break;
+        }
+        const nextTabRow = splitTabDelimitedRow(lines[index + 1]);
+        const followingTabRow =
+          index + 2 < lines.length
+            ? splitTabDelimitedRow(lines[index + 2])
+            : null;
+        if (
+          nextTabRow &&
+          followingTabRow &&
+          nextTabRow.length === followingTabRow.length
         ) {
           break;
         }
@@ -1506,22 +1693,23 @@ function App() {
     canManageSubjects = Boolean(
       admin &&
       (user.adminPermissions?.includes("admin") ||
-        user.adminPermissions?.includes("folder_manager")),
+        user.adminPermissions?.includes("teacher_assistant")),
     ),
     permissions = new Set(user.adminPermissions ?? []),
     links = admin
       ? adminLinks.filter((link) => {
           if (permissions.has("admin")) return true;
           const requiredPermissions: Partial<Record<Page, string[]>> = {
-            academic: ["folder_manager", "user_manager", "teacher_assistant"],
+            academic: ["teacher_assistant"],
             team: [],
             "test-admin": ["teacher_assistant", "testing_manager"],
             students: ["user_manager"],
             users: ["user_manager"],
             passwords: ["password_manager", "user_manager"],
+            "access-requests": ["testing_manager", "teacher_assistant"],
+            notebook: ["teacher_assistant"],
             queries: ["student_query"],
             analytics: ["testing_manager"],
-            notebook: ["folder_manager"],
           };
           if (link.id === "team") return false;
           return (
@@ -1531,7 +1719,7 @@ function App() {
           );
         })
       : studentLinks;
-  const allowed = links.some((l) => l.id === page) ? page : "dashboard";
+  const allowed = links.some((l) => l.id === page) ? page : (links[0]?.id ?? "notebook");
   return (
     <div className="layout">
       <aside className={`sidebar ${mobile ? "sidebar-open" : ""}`}>
@@ -1565,9 +1753,6 @@ function App() {
               >
                 <Icon size={18} />
                 <span>{item.title}</span>
-                {item.id === "queries" && (
-                  <span className="nav-pill">Inbox</span>
-                )}
               </button>
             );
           })}
@@ -1653,7 +1838,6 @@ function App() {
               user={user}
               notify={notify}
               canManageSources={canManageSubjects}
-              canPermanentlyDeleteStudents={permissions.has("admin")}
             />
           )}
         </div>
@@ -1783,13 +1967,11 @@ function PageContent({
   user,
   notify,
   canManageSources,
-  canPermanentlyDeleteStudents,
 }: {
   page: Page;
   user: Person;
   notify: (s: string) => void;
   canManageSources: boolean;
-  canPermanentlyDeleteStudents: boolean;
 }) {
   switch (page) {
     case "dashboard":
@@ -1807,11 +1989,11 @@ function PageContent({
     case "team":
       return <Team />;
     case "test-admin":
-      return <TestAdmin notify={notify} />;
+      return <TestAdmin user={user} notify={notify} />;
     case "access-requests":
       return <AccessRequests notify={notify} />;
     case "students":
-      return <Students canPermanentlyDelete={canPermanentlyDeleteStudents} />;
+      return <Students />;
     case "users":
       return <UsersAdmin />;
     case "passwords":
@@ -1821,7 +2003,7 @@ function PageContent({
     case "analytics":
       return <Analytics />;
     default:
-      return <Dashboard user={user} />;
+      return <Notebook admin={canManageSources} notify={notify} />;
   }
 }
 function Heading({
@@ -2070,7 +2252,9 @@ function TestRow({ row, onClick }: { row: Data; onClick?: () => void }) {
   const t = row.test ?? row;
   const a = row.attempt ?? {};
   const deadline = formatDateTime(row.effectiveDeadlineAt ?? t.deadlineAt);
-  const status = String(
+  const status = a.submittedAt && a.isResultReleased === false
+    ? "Submitted · Under marking"
+    : String(
     row.status ??
       a.status ??
       (a.marksObtained != null ? "Reviewed" : "Not started"),
@@ -2202,6 +2386,8 @@ function TestAttempt({
     [paperFile, setPaperFile] = useState<File | undefined>(),
     [busy, setBusy] = useState(false),
     [resubmitting, setResubmitting] = useState(false),
+    [gradingQueued, setGradingQueued] = useState(false),
+    [gradingPolls, setGradingPolls] = useState(0),
     [message, setMessage] = useState(""),
     [fontFamily, setFontFamily] = useState("Arial"),
     [fontSize, setFontSize] = useState("16px"),
@@ -2223,6 +2409,44 @@ function TestAttempt({
       answerEditor.current.innerText = answers[questionKey] ?? "";
     }
   }, [questionKey]);
+  useEffect(() => {
+    if (!gradingQueued) return;
+    if (
+      data?.attempt?.gradingComplete === true ||
+      data?.attempt?.status === "COMPLETED"
+    ) {
+      setGradingQueued(false);
+      setMessage(
+        `Your answers were assessed.${data.attempt.resultAvailableAt ? ` Results will be available ${formatDateTime(data.attempt.resultAvailableAt)}.` : ""}`,
+      );
+      return;
+    }
+    if (data?.attempt?.gradingError) {
+      setGradingQueued(false);
+      setMessage(
+        "AI grading could not complete. An administrator can review and retry the saved answers.",
+      );
+      return;
+    }
+    if (gradingPolls >= 60) {
+      setGradingQueued(false);
+      setMessage(
+        "Your answer pages are still being graded. Refresh this page later to check the result.",
+      );
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setGradingPolls((count) => count + 1);
+      refresh();
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [
+    gradingQueued,
+    gradingPolls,
+    data?.attempt?.status,
+    data?.attempt?.gradingComplete,
+    data?.attempt?.gradingError,
+  ]);
   function applyTextFormat(command: "bold" | "italic" | "underline") {
     answerEditor.current?.focus();
     document.execCommand(command);
@@ -2248,25 +2472,26 @@ function TestAttempt({
         ),
       );
       if (paperFile) {
-        form.append(
-          "files",
-          paperFile,
-          `paper.${paperFile.name.split(".").pop()}`,
-        );
+        await appendAnswerFile(form, paperFile, "paper");
       } else {
-        Object.entries(questionFiles).forEach(([number, file]) => {
-          if (file)
-            form.append(
-              "files",
-              file,
-              `question-${number}.${file.name.split(".").pop()}`,
-            );
-        });
+        for (const [number, file] of Object.entries(questionFiles)) {
+          if (file) await appendAnswerFile(form, file, `question-${number}`);
+        }
       }
-      await api(`/tests/${testId}/me/submit`, { method: "POST", body: form });
+      const result = await api<Data>(`/tests/${testId}/me/submit`, {
+        method: "POST",
+        body: form,
+      });
       setMessage(
-        "Your answers were saved. Automated grading is not available in this deployment.",
+        result.gradingPending
+          ? String(
+              result.gradingMessage ??
+                "Your answers were saved, but automated grading could not complete. An administrator can review and retry it.",
+            )
+          : `Your answers were saved and assessed.${result.resultAvailableAt ? ` Results will be available ${formatDateTime(result.resultAvailableAt)}.` : ""}`,
       );
+      setGradingQueued(Boolean(result.gradingQueued));
+      setGradingPolls(0);
       refresh();
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "Submission failed.");
@@ -2377,7 +2602,10 @@ function TestAttempt({
                 <Check />
               </span>
               <h2>
-                Submission status: {label(data?.attempt?.status, "Submitted")}
+                Submission status: {data?.attempt?.submittedAt &&
+                data?.attempt?.isResultReleased === false
+                  ? "Submitted — under marking"
+                  : label(data?.attempt?.status, "Submitted")}
               </h2>
               <p>
                 {data?.attempt?.marksObtained != null
@@ -2387,7 +2615,7 @@ function TestAttempt({
                     ? data?.attempt?.submittedAt
                       ? "Your submission was saved, but the result could not be prepared. You can resubmit your previous answers below."
                       : "Your submission could not be saved. Please contact an administrator."
-                    : "Your test has been submitted. Results will appear here when ready."}
+                    : `Your test has been submitted and is under marking.${data?.attempt?.resultAvailableAt ? ` Results are scheduled for ${formatDateTime(data.attempt.resultAvailableAt)}.` : " The administrator will finish the review."}`}
               </p>
               {String(data?.attempt?.status ?? "").toLowerCase() === "failed" &&
                 data?.attempt?.submittedAt &&
@@ -2783,16 +3011,18 @@ function TestAttempt({
               </span>
               <b>Upload an answer file for Question {questionKey}</b>
               <small>
-                PDF, DOCX, TXT, or an image. One file per question, up to 30 MiB
-                combined.
+                PDF, DOCX, TXT, or an image. PDF pages and clear photos are
+                checked with the configured vision-capable Ollama model.
+                Up to 30 MiB combined.
               </small>
               {questionFiles[questionKey] && (
                 <em>{questionFiles[questionKey]?.name}</em>
               )}
             </label>
             <label className="field-label">
-              Or submit one complete paper (replaces per-question uploads; up to
-              30 MiB)
+              Or submit one complete paper (replaces per-question uploads; up
+              to 30 pages and 30 MiB). PDF pages and clear photos are checked
+              with the configured vision-capable Ollama model.
               <input
                 type="file"
                 accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.webp"
@@ -2985,22 +3215,22 @@ function Notebook({
   notify: (s: string) => void;
 }) {
   const {
-    data: folderData,
-    error: folderError,
-    loading: folderLoading,
-  } = useResource<unknown[]>("/ai-notebook/folders");
-  const folders = asArray<Data>(folderData);
-  const [folderId, setFolderId] = useState("");
+    data: subjectData,
+    error: subjectError,
+    loading: subjectLoading,
+  } = useResource<unknown[]>("/ai-notebook/subjects");
+  const subjects = asArray<Data>(subjectData);
+  const [subjectId, setSubjectId] = useState("");
   useEffect(() => {
-    if (!folderId && folders.length) setFolderId(getId(folders[0]));
-  }, [folders, folderId]);
+    if (!subjectId && subjects.length) setSubjectId(getId(subjects[0]));
+  }, [subjects, subjectId]);
   const {
     data: sourceData,
     error: sourceError,
     loading: sourceLoading,
     refresh: refreshSources,
   } = useResource<unknown[]>(
-    admin && folderId ? `/ai-notebook/folders/${folderId}/sources` : undefined,
+    admin && subjectId ? `/ai-notebook/subjects/${subjectId}/sources` : undefined,
   );
   const sources = asArray<Data>(sourceData);
   const {
@@ -3010,8 +3240,8 @@ function Notebook({
     refresh: refreshSessions,
   } = useResource<unknown[]>(
     admin
-      ? folderId
-        ? `/ai-notebook/sessions?folderId=${encodeURIComponent(folderId)}`
+      ? subjectId
+        ? `/ai-notebook/sessions?subjectId=${encodeURIComponent(subjectId)}`
         : undefined
       : "/ai-notebook/sessions",
   );
@@ -3029,7 +3259,7 @@ function Notebook({
     [promptLanguage, setPromptLanguage] = useState("english"),
     [promptMessage, setPromptMessage] = useState("");
   const { data: promptData } = useResource<Data>(
-    admin && folderId ? `/ai-notebook/folders/${folderId}/prompt` : undefined,
+    subjectId ? `/ai-notebook/subjects/${subjectId}/prompt` : undefined,
   );
   useEffect(() => {
     if (promptData) {
@@ -3039,7 +3269,7 @@ function Notebook({
   }, [promptData]);
   async function chat(e: FormEvent) {
     e.preventDefault();
-    if (!folderId || !question.trim()) return;
+    if (!subjectId || !question.trim()) return;
     setChatBusy(true);
     setChatError("");
     try {
@@ -3047,7 +3277,7 @@ function Notebook({
       const result = await api<Data>(
         "/ai-notebook/chat",
         json("POST", {
-          folderId,
+          subjectId,
           question: asked,
           ...(sessionId ? { sessionId } : {}),
           ...(studyAidMode ? { studyAidMode } : {}),
@@ -3084,7 +3314,7 @@ function Notebook({
     try {
       const session = await api<Data>(`/ai-notebook/sessions/${id}`);
       const loadedMessages = asArray<Data>(session.messages);
-      if (session.folderId) setFolderId(String(session.folderId));
+      if (session.subjectId) setSubjectId(String(session.subjectId));
       setSessionId(id);
       setMessages(loadedMessages);
       setNotebookView("chat");
@@ -3128,12 +3358,12 @@ function Notebook({
       "sourceFile",
     ) as HTMLInputElement;
     const file = input.files?.[0];
-    if (!file || !folderId) return;
+    if (!file || !subjectId) return;
     setUploading(true);
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("folderId", folderId);
+      form.append("subjectId", subjectId);
       if (uploadTitle.trim()) form.append("title", uploadTitle.trim());
       await api<Data>("/ai-notebook/sources", { method: "POST", body: form });
       notify("Source uploaded to the selected subject.");
@@ -3147,14 +3377,14 @@ function Notebook({
     }
   }
   async function savePrompt() {
-    if (!folderId) return;
+    if (!subjectId) return;
     setPromptMessage("");
     try {
       await api(
-        `/ai-notebook/folders/${folderId}/prompt/default`,
+        `/ai-notebook/subjects/${subjectId}/prompt/${admin ? "default" : "personal"}`,
         json("PUT", { prompt, responseLanguage: promptLanguage }),
       );
-      setPromptMessage("Default prompt saved.");
+      setPromptMessage(admin ? "Default prompt saved." : "Your notebook preferences saved.");
     } catch (ex) {
       setPromptMessage(
         ex instanceof Error ? ex.message : "Could not save prompt.",
@@ -3192,11 +3422,11 @@ function Notebook({
         information with your course material or instructor, and do not share
         passwords or sensitive personal information here.
       </p>
-      {folderError ? (
-        <ErrorBox error={folderError} />
-      ) : folderLoading ? (
+      {subjectError ? (
+        <ErrorBox error={subjectError} />
+      ) : subjectLoading ? (
         <LoadingCard />
-      ) : !folders.length ? (
+      ) : !subjects.length ? (
         <Card>
           <Empty
             title="No subjects available"
@@ -3217,16 +3447,16 @@ function Notebook({
                   <Folder size={18} />
                 </div>
                 <div className="folder-list">
-                  {folders.map((f) => (
+                  {subjects.map((f) => (
                     <button
                       key={getId(f)}
                       onClick={() => {
-                        setFolderId(getId(f));
+                        setSubjectId(getId(f));
                         setSessionId("");
                         setChatError("");
                         setMessages([]);
                       }}
-                      className={`folder-choice ${folderId === getId(f) ? "selected" : ""}`}
+                      className={`folder-choice ${subjectId === getId(f) ? "selected" : ""}`}
                     >
                       <Folder size={17} />
                       <span>{getTitle(f)}</span>
@@ -3347,9 +3577,9 @@ function Notebook({
                   ) : sessions.length ? (
                     <div className="notebook-history-list">
                       {sessions.map((session) => {
-                        const subject = folders.find(
-                          (folder) =>
-                            getId(folder) === String(session.folderId ?? ""),
+                        const subject = subjects.find(
+                          (item) =>
+                            getId(item) === String(session.subjectId ?? ""),
                         );
                         return (
                           <button
@@ -3689,6 +3919,54 @@ function Notebook({
                   </Card>
                 </>
               )}
+              {!admin && (
+                <Card>
+                  <div className="card-heading">
+                    <div>
+                      <h2>Notebook preferences</h2>
+                      <p>
+                        Choose your response language and personal instructions.
+                        These apply only to your account.
+                      </p>
+                    </div>
+                  </div>
+                  <label className="field-label">
+                    Personal prompt
+                    <textarea
+                      rows={4}
+                      maxLength={4000}
+                      value={prompt}
+                      onChange={(event) => setPrompt(event.target.value)}
+                      placeholder="Optional instructions for how the notebook should answer you…"
+                    />
+                  </label>
+                  <label className="field-label small-field">
+                    Response language
+                    <select
+                      value={promptLanguage}
+                      onChange={(event) => setPromptLanguage(event.target.value)}
+                    >
+                      <option value="english">English</option>
+                      <option value="urdu">Urdu</option>
+                      <option value="roman_urdu">Roman Urdu</option>
+                    </select>
+                  </label>
+                  {promptMessage && (
+                    <div
+                      className={`alert ${promptMessage.includes("saved") ? "success" : "error"}`}
+                      role="status"
+                    >
+                      {promptMessage}
+                    </div>
+                  )}
+                  <button
+                    className="button secondary"
+                    onClick={() => void savePrompt()}
+                  >
+                    Save my preferences
+                  </button>
+                </Card>
+              )}
             </div>
           </div>
         </>
@@ -3698,69 +3976,33 @@ function Notebook({
 }
 function Academic({ canManageSources }: { canManageSources: boolean }) {
   const {
-    data: schoolData,
-    error: schoolError,
-    loading,
-    refresh: refreshSchools,
-  } = useResource<unknown[]>(canManageSources ? "/school/list" : undefined);
-  const {
     data: subjectData,
     error: subjectError,
+    loading,
     refresh: refreshSubjects,
   } = useResource<unknown[]>("/subjects/list");
-  const { data: folderData, refresh: refreshFolders } = useResource<unknown[]>(
-    canManageSources ? "/folders" : undefined,
-  );
-  const schools = asArray<Data>(schoolData),
-    folders = asArray<Data>(folderData),
-    subjects = asArray<Data>(subjectData);
-  const [schoolName, setSchoolName] = useState(""),
-    [newSubject, setNewSubject] = useState(""),
+  const subjects = asArray<Data>(subjectData);
+  const [newSubject, setNewSubject] = useState(""),
     [subjectCode, setSubjectCode] = useState(""),
     [actionError, setActionError] = useState(""),
     [busy, setBusy] = useState("");
-  const refreshStructure = () => {
-    refreshSchools();
-    refreshFolders();
-    refreshSubjects();
-  };
-  async function createSchool(e: FormEvent) {
-    e.preventDefault();
-    setBusy("school");
-    setActionError("");
-    try {
-      await api("/school", json("POST", { name: schoolName.trim() }));
-      setSchoolName("");
-      refreshStructure();
-    } catch (ex) {
-      setActionError(
-        ex instanceof Error ? ex.message : "Could not create school.",
-      );
-    } finally {
-      setBusy("");
-    }
-  }
   async function createSubject(e: FormEvent) {
     e.preventDefault();
     setBusy("subject");
     setActionError("");
     try {
-      const schoolId = getId(schools[0] ?? {});
-      if (!schoolId)
-        throw new Error("Create a school first to enable subjects.");
       const code =
         subjectCode.trim() || `SUB-${Date.now().toString(36).toUpperCase()}`;
       await api(
         "/subjects",
         json("POST", {
-          schoolId,
           code,
           name: newSubject.trim(),
         }),
       );
       setNewSubject("");
       setSubjectCode("");
-      refreshStructure();
+      refreshSubjects();
     } catch (ex) {
       setActionError(
         ex instanceof Error ? ex.message : "Could not create subject.",
@@ -3784,35 +4026,11 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
           tone="blue"
         />
       </div>
-      {(actionError || subjectError || schoolError) && (
-        <ErrorBox error={actionError || subjectError || schoolError || ""} />
+      {(actionError || subjectError) && (
+        <ErrorBox error={actionError || subjectError || ""} />
       )}
       {canManageSources && (
         <div className="academic-create-grid subject-create-grid">
-          {!schools.length && (
-            <Card>
-              <h2>Set up organization</h2>
-              <p className="api-note">
-                The current backend requires an organization for subject
-                records.
-              </p>
-              <form className="form-stack compact-form" onSubmit={createSchool}>
-                <label>
-                  Organization name
-                  <input
-                    required
-                    minLength={2}
-                    maxLength={255}
-                    value={schoolName}
-                    onChange={(e) => setSchoolName(e.target.value)}
-                  />
-                </label>
-                <button className="button primary" disabled={busy === "school"}>
-                  {busy === "school" ? "Saving…" : "Continue"}
-                </button>
-              </form>
-            </Card>
-          )}
           <Card>
             <h2>Add subject</h2>
             <p className="api-note">
@@ -3841,7 +4059,7 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
               </label>
               <button
                 className="button primary"
-                disabled={busy === "subject" || !schools.length}
+                disabled={busy === "subject"}
               >
                 {busy === "subject" ? "Creating…" : "Add subject"}
               </button>
@@ -3864,13 +4082,7 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
             <span className="count-badge">{subjects.length}</span>
           </div>
           {subjects.length ? (
-            subjects.map((subject) => {
-              const folder = folders.find(
-                (item) =>
-                  String(item.subjectId ?? item.subject?.id ?? "") ===
-                  getId(subject),
-              );
-              return (
+            subjects.map((subject) => (
                 <div key={getId(subject)} className="subject-source-group">
                   <div className="source-row">
                     <span className="row-icon">
@@ -3881,16 +4093,11 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
                       <small>{subject.code ?? ""}</small>
                     </div>
                   </div>
-                  {folder && canManageSources ? (
-                    <SubjectSources folderId={getId(folder)} canManage />
-                  ) : canManageSources ? (
-                    <p className="api-note">
-                      Subject sources are temporarily unavailable.
-                    </p>
-                  ) : null}
+                  {canManageSources && (
+                    <SubjectSources subjectId={getId(subject)} canManage />
+                  )}
                 </div>
-              );
-            })
+              ))
           ) : (
             <Empty
               title="No subjects yet"
@@ -3904,14 +4111,14 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
   );
 }
 function SubjectSources({
-  folderId,
+  subjectId,
   canManage,
 }: {
-  folderId: string;
+  subjectId: string;
   canManage: boolean;
 }) {
   const { data, error, loading, refresh } = useResource<unknown[]>(
-    `/ai-notebook/folders/${folderId}/sources`,
+    `/ai-notebook/subjects/${subjectId}/sources`,
   );
   const sources = asArray<Data>(data);
   const [adding, setAdding] = useState(false);
@@ -3938,7 +4145,7 @@ function SubjectSources({
     setUploadError("");
     const form = new FormData();
     form.append("file", file);
-    form.append("folderId", folderId);
+    form.append("subjectId", subjectId);
     try {
       await api("/ai-notebook/sources", { method: "POST", body: form });
       input.value = "";
@@ -4321,572 +4528,215 @@ function Team() {
     </>
   );
 }
-function Students({ canPermanentlyDelete }: { canPermanentlyDelete: boolean }) {
-  const { data, error, loading, refresh } =
-    useResource<unknown[]>("/students/list");
-  const { data: subjectData, error: subjectError } =
-    useResource<unknown[]>("/subjects/list");
-  const { data: folderData } = useResource<unknown[]>("/folders");
-  const rows = asArray<Data>(data);
-  const subjects = asArray<Data>(subjectData),
-    folders = asArray<Data>(folderData);
-  const [search, setSearch] = useState(""),
-    [creating, setCreating] = useState(false),
-    [crn, setCrn] = useState(""),
-    [fullName, setFullName] = useState(""),
-    [email, setEmail] = useState(""),
-    [phone, setPhone] = useState(""),
-    [selectedSubjects, setSelectedSubjects] = useState<string[]>([]),
-    [created, setCreated] = useState<Data | null>(null),
-    [formError, setFormError] = useState(""),
-    [notice, setNotice] = useState(""),
-    [deletingId, setDeletingId] = useState(""),
-    [busy, setBusy] = useState(false);
-  async function createStudent(e: FormEvent) {
-    e.preventDefault();
+function Students() {
+  const { data: userData, error, loading, refresh } = useResource<unknown[]>("/users");
+  const { data: subjectData, error: subjectError } = useResource<unknown[]>("/subjects/list");
+  const students = asArray<Data>(userData).filter((user) => user.role === "student");
+  const subjects = asArray<Data>(subjectData);
+  const [search, setSearch] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [crn, setCrn] = useState("");
+  const [subjectIds, setSubjectIds] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState("");
+  const [notice, setNotice] = useState("");
+  const filtered = students.filter((student) =>
+    `${student.fullName ?? ""} ${student.email ?? ""} ${student.studentId ?? ""} ${student.phone ?? ""}`
+      .toLowerCase()
+      .includes(search.toLowerCase()),
+  );
+
+  async function createStudent(event: FormEvent) {
+    event.preventDefault();
     setBusy(true);
     setFormError("");
-    setCreated(null);
+    setNotice("");
     try {
-      if (!selectedSubjects.length)
-        throw new Error(
-          "Select at least one subject to grant access to the student's email account.",
-        );
-      const targetFolders = selectedSubjects.map((subjectId) =>
-        folders.find(
-          (folder) =>
-            String(folder.subjectId ?? folder.subject?.id ?? "") === subjectId,
-        ),
-      );
-      if (targetFolders.some((folder) => !folder)) {
-        throw new Error(
-          "One or more selected subjects is unavailable for access. Refresh the list or contact the administrator.",
-        );
-      }
-      const student = await api<Data>(
-        "/students",
-        json("POST", {
-          enrollmentNo: crn.trim(),
-          fullName: fullName.trim(),
-          email: email.trim(),
-          phone: phone.trim(),
-        }),
-      );
-      const userId = String(student.userId ?? student.user?.id ?? "");
-      if (!userId)
-        throw new Error(
-          "Student profile was created, but its login user ID was not returned. Subject access was not granted.",
-        );
-      setCreated({ ...student, email: email.trim(), grantedSubjects: [] });
-      setCrn("");
-      setFullName("");
-      setEmail("");
-      setPhone("");
-      setSelectedSubjects([]);
-      setCreating(false);
-      refresh();
-      const grants: string[] = [];
-      const grantErrors: string[] = [];
-      for (const folder of targetFolders) {
-        try {
-          await api(
-            `/folders/${getId(folder!)}/permissions`,
-            json("POST", { userId }),
-          );
-          grants.push(getTitle(folder!));
-        } catch (ex) {
-          grantErrors.push(
-            `${getTitle(folder!)}: ${ex instanceof Error ? ex.message : "permission could not be granted"}`,
-          );
-        }
-      }
-      setCreated({
-        ...student,
+      const created = await api<Data>("/users", json("POST", {
+        role: "student",
+        fullName: fullName.trim(),
         email: email.trim(),
-        grantedSubjects: grants,
-        accessIncomplete: grantErrors.length > 0,
-      });
-      if (grantErrors.length) {
-        throw new Error(
-          `Student account was created, but subject access is incomplete. Granted: ${grants.join(", ") || "none"}. Failed: ${grantErrors.join("; ")}`,
-        );
-      }
-      setCrn("");
+        phone: phone.trim(),
+        crn: crn.trim(),
+        subjectIds,
+      }));
       setFullName("");
       setEmail("");
       setPhone("");
-      setSelectedSubjects([]);
+      setCrn("");
+      setSubjectIds([]);
       setCreating(false);
-      refresh();
+      setNotice(`Student created. CRN: ${created.studentId}. Initial password: abc@123. The student must change it at first sign-in.`);
+      await refresh();
     } catch (ex) {
-      setFormError(
-        ex instanceof Error ? ex.message : "Could not create student.",
-      );
+      setFormError(ex instanceof Error ? ex.message : "Could not create student account.");
     } finally {
       setBusy(false);
     }
   }
-  async function deleteStudent(student: Data) {
-    const studentId = getId(student);
-    if (!studentId || deletingId) return;
-    const name = String(student.fullName ?? "this student");
-    if (
-      !window.confirm(
-        `Permanently delete ${name}? This will delete the student profile, login account, test attempts, attendance, fee/payment history, and other associated records. This cannot be undone.`,
-      )
-    ) {
-      return;
-    }
-    setDeletingId(studentId);
-    setFormError("");
-    setNotice("");
-    try {
-      await api(`/students/${studentId}/permanent`, { method: "DELETE" });
-      setNotice(`${name} and associated records were permanently deleted.`);
-      await refresh();
-    } catch (ex) {
-      setFormError(
-        ex instanceof Error ? ex.message : "Could not delete the student.",
-      );
-    } finally {
-      setDeletingId("");
-    }
-  }
-  const filtered = rows.filter((r) =>
-    `${r.fullName ?? ""} ${r.user?.email ?? r.email ?? ""} ${r.enrollmentNo ?? ""} ${r.phone ?? ""}`
-      .toLowerCase()
-      .includes(search.toLowerCase()),
-  );
+
   return (
     <>
       <Heading
-        eyebrow="ROSTER"
+        eyebrow="STUDENT ACCOUNTS"
         title="Students"
-        description="Student roster returned by the authorized school API."
-        action={
-          <button
-            className="button primary"
-            onClick={() => {
-              setCreating((value) => !value);
-              setCreated(null);
-            }}
-          >
-            <Plus size={16} /> Add student
-          </button>
-        }
+        description="Create student logins and choose which subjects they can access."
+        action={<button className="button primary" onClick={() => setCreating((value) => !value)}><Plus size={16} /> Add student</button>}
       />
-      {formError && <ErrorBox error={formError} />}
-      {notice && <div className="alert success">{notice}</div>}
-      {created && (
-        <div
-          className={`alert ${created.accessIncomplete ? "warning" : "success"}`}
-        >
-          Student account <b>{String(created.email ?? email)}</b> was enrolled.
-          Subject access granted:{" "}
-          {asArray<string>(created.grantedSubjects).join(", ") || "none yet"}
-          {created.accessIncomplete &&
-            ". Some access grants failed; review the error and finish them from Users."}
-          .
-          {created.generatedPassword && (
-            <>
-              {" "}
-              Share this one-time password securely:{" "}
-              <b>{String(created.generatedPassword)}</b> The student must change
-              it at first sign-in.
-            </>
-          )}
-        </div>
-      )}
+      {error && <ErrorBox error={error} />}
       {subjectError && <ErrorBox error={subjectError} />}
+      {formError && <ErrorBox error={formError} />}
+      {notice && <div className="alert success" role="status">{notice}</div>}
       {creating && (
         <Card>
-          <div className="card-heading">
-            <div>
-              <h2>Enroll a student</h2>
-              <p>
-                Email is the student's login and receives access to the selected
-                subjects.
-              </p>
-            </div>
-          </div>
-          <form className="form-stack" onSubmit={createStudent}>
+          <div className="card-heading"><div><h2>Add student</h2><p>The student signs in with this email and CRN.</p></div></div>
+          <form className="form-stack" onSubmit={(event) => void createStudent(event)}>
             <div className="inline-fields">
-              <label>
-                CRN number
-                <input
-                  name="crn"
-                  autoComplete="off"
-                  required
-                  maxLength={32}
-                  value={crn}
-                  onChange={(e) => setCrn(e.target.value)}
-                />
-              </label>
-              <label>
-                Full name
-                <input
-                  name="fullName"
-                  autoComplete="name"
-                  required
-                  minLength={2}
-                  maxLength={255}
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                />
-              </label>
+              <label>Full name<input name="fullName" autoComplete="name" required minLength={2} maxLength={200} value={fullName} onChange={(event) => setFullName(event.target.value)} /></label>
+              <label>CRN number<input name="crn" required maxLength={32} value={crn} onChange={(event) => setCrn(event.target.value)} /></label>
             </div>
-            <label>
-              Student email
-              <input
-                name="email"
-                type="email"
-                autoComplete="username"
-                spellCheck={false}
-                required
-                maxLength={254}
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </label>
-            <label>
-              Phone number
-              <input
-                name="phone"
-                type="tel"
-                autoComplete="tel"
-                required
-                minLength={7}
-                maxLength={32}
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="+1 555 123 4567"
-              />
-            </label>
-            <fieldset className="permission-options subject-access-options">
+            <div className="inline-fields">
+              <label>Student email<input name="email" type="email" autoComplete="email" required maxLength={254} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+              <label>Phone number<input name="phone" type="tel" autoComplete="tel" required minLength={7} maxLength={32} value={phone} onChange={(event) => setPhone(event.target.value)} /></label>
+            </div>
+            <fieldset className="permission-options">
               <legend>Subject access</legend>
-              {subjects.map((subject) => (
-                <label key={getId(subject)}>
-                  <input
-                    type="checkbox"
-                    checked={selectedSubjects.includes(getId(subject))}
-                    onChange={(e) =>
-                      setSelectedSubjects(
-                        e.target.checked
-                          ? [...selectedSubjects, getId(subject)]
-                          : selectedSubjects.filter(
-                              (id) => id !== getId(subject),
-                            ),
-                      )
-                    }
-                  />
-                  {getTitle(subject)}
-                </label>
-              ))}
-              {!subjects.length && (
-                <span className="api-note">
-                  {subjectError
-                    ? "Could not load subjects."
-                    : "Create subjects before enrolling students."}
-                </span>
-              )}
+              {subjects.length ? subjects.map((subject) => {
+                const id = getId(subject);
+                return <label key={id}><input type="checkbox" checked={subjectIds.includes(id)} onChange={(event) => setSubjectIds((current) => event.target.checked ? [...current, id] : current.filter((value) => value !== id))} />{getTitle(subject)}</label>;
+              }) : <p className="subtle-padding">Create a subject first, or add access later from Users.</p>}
             </fieldset>
-            <button className="button primary" disabled={busy}>
-              {busy ? "Enrolling…" : "Enroll student"}
-            </button>
+            <p className="subtle-padding">Initial password: <b>abc@123</b>. The student must change it at first sign-in.</p>
+            <button className="button primary" disabled={busy}>{busy ? "Creating…" : "Create student"}</button>
           </form>
         </Card>
       )}
       <Card>
-        <div className="card-heading">
-          <div>
-            <h2>Student directory</h2>
-            <p>{rows.length} records</p>
+        <div className="card-heading"><div><h2>Student accounts</h2><p>{students.length} students</p></div></div>
+        <label className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, email, CRN or phone" aria-label="Search students" /></label>
+        {loading ? <LoadingCard /> : filtered.length ? filtered.map((student) => (
+          <div className="source-row" key={getId(student)}>
+            <span className="row-icon"><Users size={16} /></span>
+            <div><b>{student.fullName || student.email || getId(student)}</b><small>{student.email} · CRN {student.studentId || "—"} · {student.phone || "No phone"}</small></div>
           </div>
-          <label className="search-field">
-            <Search size={16} />
-            <input
-              aria-label="Search students"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search roster"
-            />
-          </label>
-        </div>
-        {loading ? (
-          <div className="loading">
-            <span className="spinner" />
-            Loading student records…
-          </div>
-        ) : error ? (
-          <ErrorBox error={error} />
-        ) : filtered.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Student</th>
-                  <th>Email</th>
-                  <th>CRN</th>
-                  <th>Phone</th>
-                  <th>Status</th>
-                  {canPermanentlyDelete && <th>Actions</th>}
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((r, i) => (
-                  <tr key={getId(r) || i}>
-                    <td>
-                      <div className="person-cell">
-                        <span className="avatar light">
-                          {String(r.fullName ?? "S").slice(0, 1)}
-                        </span>
-                        <b>{r.fullName ?? "—"}</b>
-                      </div>
-                    </td>
-                    <td>{r.user?.email ?? r.email ?? "—"}</td>
-                    <td>{r.enrollmentNo ?? "—"}</td>
-                    <td>{r.phone ?? "—"}</td>
-                    <td>
-                      <span
-                        className={`status ${r.status === "active" ? "success" : ""}`}
-                      >
-                        {r.status ?? "Active"}
-                      </span>
-                    </td>
-                    {canPermanentlyDelete && (
-                      <td>
-                        <button
-                          className="button danger small-button"
-                          disabled={Boolean(deletingId)}
-                          onClick={() => void deleteStudent(r)}
-                          title={`Permanently delete ${r.fullName ?? "student"}`}
-                        >
-                          <Trash2 size={15} />
-                          {deletingId === getId(r)
-                            ? "Deleting…"
-                            : "Delete permanently"}
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <Empty
-            title="No matching students"
-            detail="Try another search or check the server-side roster filters."
-            icon={Users}
-          />
-        )}
+        )) : <Empty title="No students found" detail="Create a student account or adjust the search." icon={Users} />}
       </Card>
     </>
   );
 }
 function UsersAdmin() {
-  const { data: userData, error, loading } = useResource<unknown[]>("/users");
-  const { data: folderData } = useResource<unknown[]>("/folders");
-  const users = asArray<Data>(userData),
-    folders = asArray<Data>(folderData);
-  const [search, setSearch] = useState(""),
-    [selectedUserId, setSelectedUserId] = useState(""),
-    [permissions, setPermissions] = useState<Data[]>([]),
-    [folderId, setFolderId] = useState(""),
-    [permissionsError, setPermissionsError] = useState(""),
-    [busy, setBusy] = useState(false);
-  const selectedUser = users.find((user) => getId(user) === selectedUserId);
-  const filteredUsers = users.filter((user) =>
-    `${user.email ?? ""} ${user.studentId ?? ""}`
+  const { data: userData, error, loading, refresh } = useResource<unknown[]>("/users");
+  const { data: subjectData, error: subjectError } = useResource<unknown[]>("/subjects/list");
+  const students = asArray<Data>(userData).filter((user) => user.role === "student");
+  const subjects = asArray<Data>(subjectData);
+  const [search, setSearch] = useState("");
+  const [editingId, setEditingId] = useState("");
+  const [draftSubjectIds, setDraftSubjectIds] = useState<string[]>([]);
+  const [savingId, setSavingId] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [notice, setNotice] = useState("");
+  const filtered = students.filter((student) =>
+    `${student.fullName ?? ""} ${student.email ?? ""} ${student.studentId ?? ""}`
       .toLowerCase()
       .includes(search.toLowerCase()),
   );
-  async function loadPermissions(userId: string) {
-    setSelectedUserId(userId);
-    setPermissionsError("");
+
+  async function saveAccess(userId: string) {
+    setSavingId(userId);
+    setErrorMessage("");
+    setNotice("");
     try {
-      const result = await api<unknown[]>(
-        `/folders/permissions?userId=${encodeURIComponent(userId)}`,
-      );
-      setPermissions(asArray<Data>(result));
+      await api(`/users/${userId}/subjects`, json("PUT", { subjectIds: draftSubjectIds }));
+      setEditingId("");
+      setNotice("Student subject access updated.");
+      await refresh();
     } catch (ex) {
-      setPermissionsError(
-        ex instanceof Error ? ex.message : "Could not load subject access.",
-      );
-      setPermissions([]);
-    }
-  }
-  async function grant() {
-    if (!folderId || !selectedUserId) return;
-    setBusy(true);
-    setPermissionsError("");
-    try {
-      await api(
-        `/folders/${folderId}/permissions`,
-        json("POST", { userId: selectedUserId }),
-      );
-      await loadPermissions(selectedUserId);
-      setFolderId("");
-    } catch (ex) {
-      setPermissionsError(
-        ex instanceof Error ? ex.message : "Could not grant subject access.",
-      );
+      setErrorMessage(ex instanceof Error ? ex.message : "Could not update subject access.");
     } finally {
-      setBusy(false);
+      setSavingId("");
     }
   }
-  async function revoke(permissionId: string) {
-    setBusy(true);
-    setPermissionsError("");
-    try {
-      await api(`/folders/permissions/${permissionId}`, { method: "DELETE" });
-      await loadPermissions(selectedUserId);
-    } catch (ex) {
-      setPermissionsError(
-        ex instanceof Error ? ex.message : "Could not revoke subject access.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
+
   return (
     <>
-      <Heading
-        eyebrow="ACCOUNTS & ACCESS"
-        title="Users"
-        description="Review login accounts and manage each student's subject access."
-      />
+      <Heading eyebrow="STUDENT ACCESS" title="Users" description="Manage the subjects each student can open in Tests and AI Notebook." />
       {error && <ErrorBox error={error} />}
-      <div className="users-access-layout">
-        <Card>
-          <div className="card-heading">
-            <div>
-              <h2>Accounts</h2>
-              <p>{users.length} users</p>
-            </div>
-          </div>
-          <label className="search-field">
-            <Search size={16} />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search by email or ID"
-              aria-label="Search accounts"
-            />
-          </label>
-          {loading ? (
-            <LoadingCard />
-          ) : (
-            filteredUsers.map((user) => (
-              <button
-                key={getId(user)}
-                className={`tree-row ${selectedUserId === getId(user) ? "tree-selected" : ""}`}
-                onClick={() => void loadPermissions(getId(user))}
-              >
-                <Users size={16} />
-                <span>{user.email ?? getId(user)}</span>
-                <ChevronRight size={16} />
-              </button>
-            ))
-          )}
-          {!loading && !filteredUsers.length && (
-            <p className="subtle-padding">No matching accounts.</p>
-          )}
-        </Card>
-        <Card>
-          <div className="card-heading">
-            <div>
-              <h2>Subject access</h2>
-              <p>{selectedUser?.email ?? "Select an account"}</p>
-            </div>
-          </div>
-          {permissionsError && <ErrorBox error={permissionsError} />}
-          {selectedUserId && (
-            <>
-              <div className="inline-fields">
-                <label>
-                  Grant subject
-                  <select
-                    value={folderId}
-                    onChange={(e) => setFolderId(e.target.value)}
-                  >
-                    <option value="">Choose subject</option>
-                    {folders
-                      .filter(
-                        (folder) =>
-                          !permissions.some(
-                            (permission) =>
-                              getId(permission.folder ?? {}) === getId(folder),
-                          ),
-                      )
-                      .map((folder) => (
-                        <option key={getId(folder)} value={getId(folder)}>
-                          {getTitle(folder)}
-                        </option>
-                      ))}
-                  </select>
-                </label>
-                <button
-                  className="button primary"
-                  disabled={busy || !folderId}
-                  onClick={() => void grant()}
-                >
-                  Grant access
-                </button>
+      {subjectError && <ErrorBox error={subjectError} />}
+      {errorMessage && <ErrorBox error={errorMessage} />}
+      {notice && <div className="alert success" role="status">{notice}</div>}
+      <Card>
+        <div className="card-heading"><div><h2>Student subject access</h2><p>{students.length} students</p></div></div>
+        <label className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, email or CRN" aria-label="Search students" /></label>
+        {loading ? <LoadingCard /> : filtered.length ? filtered.map((student) => {
+          const userId = getId(student);
+          const currentSubjectIds = asArray<string>(student.subjectIds);
+          const isEditing = editingId === userId;
+          return (
+            <div className="subject-source-group" key={userId}>
+              <div className="source-row">
+                <span className="row-icon"><Users size={16} /></span>
+                <div><b>{student.fullName || student.email || userId}</b><small>{student.email} · CRN {student.studentId || "—"} · {currentSubjectIds.length} subjects</small></div>
+                <button className="button secondary" onClick={() => { setEditingId(isEditing ? "" : userId); setDraftSubjectIds(currentSubjectIds); setErrorMessage(""); }}>{isEditing ? "Cancel" : "Manage access"}</button>
               </div>
-              {permissions.map((permission) => (
-                <div className="source-row" key={getId(permission)}>
-                  <span className="row-icon">
-                    <Folder size={16} />
-                  </span>
-                  <div>
-                    <b>{getTitle(permission.folder ?? {})}</b>
-                    <small>
-                      {permission.canView ? "Can view" : "No view access"}
-                    </small>
-                  </div>
-                  <button
-                    className="button secondary small-button"
-                    disabled={busy}
-                    onClick={() => void revoke(getId(permission))}
-                  >
-                    Revoke
-                  </button>
-                </div>
-              ))}
-              {!permissions.length && !permissionsError && (
-                <p className="subtle-padding">No subject access assigned.</p>
-              )}
-            </>
-          )}
-        </Card>
-      </div>
+              {isEditing && <div className="detail-card">
+                <fieldset className="permission-options compact-permissions"><legend>Subjects this student can access</legend>
+                  {subjects.length ? subjects.map((subject) => {
+                    const subjectId = getId(subject);
+                    return <label key={subjectId}><input type="checkbox" checked={draftSubjectIds.includes(subjectId)} onChange={(event) => setDraftSubjectIds((current) => event.target.checked ? [...current, subjectId] : current.filter((value) => value !== subjectId))} />{getTitle(subject)}</label>;
+                  }) : <p className="subtle-padding">No subjects are available.</p>}
+                </fieldset>
+                <button className="button primary" disabled={savingId === userId} onClick={() => void saveAccess(userId)}>{savingId === userId ? "Saving…" : "Save access"}</button>
+              </div>}
+            </div>
+          );
+        }) : <Empty title="No students found" detail="Add a student from the Students tab or adjust the search." icon={Users} />}
+      </Card>
     </>
   );
-}
-function TestAdmin({ notify }: { notify: (s: string) => void }) {
+}function TestAdmin({
+  user,
+  notify,
+}: {
+  user: Person;
+  notify: (s: string) => void;
+}) {
   const { data, error, loading } = useResource<unknown[]>("/tests");
-  const { data: folderData } = useResource<unknown[]>("/folders");
+  const { data: subjectData } = useResource<unknown[]>("/subjects/list");
+  const canManageGradingSettings = Boolean(
+    roleIsAdmin(user) &&
+      (user.adminPermissions?.includes("admin") ||
+        user.adminPermissions?.includes("testing_manager")),
+  );
   const {
     data: gradingSettingsData,
     error: gradingSettingsError,
     loading: gradingSettingsLoading,
     refresh: refreshGradingSettings,
-  } = useResource<Data>("/tests/ai-grading-settings");
+  } = useResource<Data>(
+    canManageGradingSettings ? "/tests/ai-grading-settings" : undefined,
+  );
   const tests = asArray<Data>(data),
-    folders = asArray<Data>(folderData);
+    subjects = asArray<Data>(subjectData);
   const [deficiencyReportPrompt, setDeficiencyReportPrompt] = useState("");
+  const [resultReleaseDelayHours, setResultReleaseDelayHours] = useState("24");
   const [savingReportPrompt, setSavingReportPrompt] = useState(false);
   const [reportPromptMessage, setReportPromptMessage] = useState("");
   const [sourceFileBusy, setSourceFileBusy] = useState("");
   const [selected, setSelected] = useState(""),
+    [activeTab, setActiveTab] = useState<"tests" | "settings">("tests"),
     [showCreate, setShowCreate] = useState(false),
     [showPreview, setShowPreview] = useState(false),
-    [folderId, setFolderId] = useState("");
+    [subjectId, setSubjectId] = useState("");
   useEffect(() => {
     if (gradingSettingsData) {
       setDeficiencyReportPrompt(
         String(gradingSettingsData.deficiencyReportPrompt ?? ""),
+      );
+      setResultReleaseDelayHours(
+        String(gradingSettingsData.resultReleaseDelayHours ?? 24),
       );
     }
   }, [gradingSettingsData]);
@@ -4897,9 +4747,12 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
     try {
       await api(
         "/tests/ai-grading-settings",
-        json("PUT", { deficiencyReportPrompt }),
+        json("PUT", {
+          deficiencyReportPrompt,
+          resultReleaseDelayHours: Number(resultReleaseDelayHours),
+        }),
       );
-      setReportPromptMessage("Deficiency report prompt saved.");
+      setReportPromptMessage("Grading settings saved.");
       refreshGradingSettings();
     } catch (ex) {
       setReportPromptMessage(
@@ -4945,13 +4798,8 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
     }
   }
   const filtered = tests.filter((t) => {
-    if (folderId) {
-      const ids = [
-        ...asArray<Data>(t.folders).map(getId),
-        ...asArray<string>(t.folderIds),
-      ];
-      if (!ids.includes(folderId)) return false;
-    }
+    if (subjectId && String(t.subjectId ?? t.subject?.id ?? "") !== subjectId)
+      return false;
     return true;
   });
   return (
@@ -4960,7 +4808,7 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
         eyebrow="ASSESSMENTS"
         title="Tests & Marks"
         description="Browse tests by subject, review attempts, and update marks."
-        action={
+        action={activeTab === "tests" ? (
           <div className="button-row">
             <button
               className="button secondary"
@@ -4975,9 +4823,31 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
               <Plus size={16} /> Create test
             </button>
           </div>
-        }
+        ) : undefined}
       />
-      {error && <ErrorBox error={error} />}
+      <div className="admin-tabs" role="tablist" aria-label="Tests and settings">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "tests"}
+          className={activeTab === "tests" ? "active" : ""}
+          onClick={() => setActiveTab("tests")}
+        >
+          Tests & review
+        </button>
+        {canManageGradingSettings && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "settings"}
+            className={activeTab === "settings" ? "active" : ""}
+            onClick={() => setActiveTab("settings")}
+          >
+            Settings
+          </button>
+        )}
+      </div>
+      {activeTab === "settings" && canManageGradingSettings ? (
       <Card className="grading-prompt-card">
         <div className="card-heading">
           <div>
@@ -5011,6 +4881,28 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
                 aria-describedby="ai-deficiency-report-prompt-help"
               />
             </label>
+            <label htmlFor="test-result-release-delay">
+              Release marks to students after (hours)
+              <input
+                id="test-result-release-delay"
+                type="number"
+                min="0"
+                max="720"
+                step="1"
+                required
+                value={resultReleaseDelayHours}
+                onChange={(event) =>
+                  setResultReleaseDelayHours(event.target.value)
+                }
+                disabled={gradingSettingsLoading || savingReportPrompt}
+                aria-describedby="test-result-release-delay-help"
+              />
+              <small id="test-result-release-delay-help">
+                AI marks are saved when assessment finishes but stay hidden
+                until this delay passes. Use 0 to release marks immediately;
+                the maximum is 720 hours.
+              </small>
+            </label>
             <div className="grading-prompt-footer">
               <small id="ai-deficiency-report-prompt-help">
                 Up to 4,000 characters. This guides report wording only; it
@@ -5032,7 +4924,7 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
                 className="button primary"
                 disabled={gradingSettingsLoading || savingReportPrompt}
               >
-                {savingReportPrompt ? "Saving…" : "Save report prompt"}
+                {savingReportPrompt ? "Saving…" : "Save grading settings"}
               </button>
               <button
                 className="button secondary"
@@ -5055,15 +4947,18 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
           </form>
         )}
       </Card>
+      ) : (
+      <>
+      {error && <ErrorBox error={error} />}
       <div className="scope-bar">
         <label>
           Subject
           <select
-            value={folderId}
-            onChange={(e) => setFolderId(e.target.value)}
+            value={subjectId}
+            onChange={(e) => setSubjectId(e.target.value)}
           >
             <option value="">All subjects</option>
-            {folders.map((f) => (
+            {subjects.map((f) => (
               <option key={getId(f)} value={getId(f)}>
                 {getTitle(f)}
               </option>
@@ -5072,12 +4967,9 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
         </label>
         <span className="scope-count">{filtered.length} scoped tests</span>
       </div>
-      <div className="admin-tabs">
-        <span className="active">Tests & review</span>
-        <span className="disabled-label">
-          Expired-test requests are handled in Access Requests.
-        </span>
-      </div>
+      <p className="test-admin-note">
+        Expired-test requests are handled in Access Requests.
+      </p>
       {loading ? (
         <LoadingCard />
       ) : (
@@ -5111,8 +5003,7 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
                       <b>{getTitle(t)}</b>
                       <small>
                         {t.totalMarks ?? "?"} marks ·{" "}
-                        {asArray<Data>(t.folders).map(getTitle).join(", ") ||
-                          "No subject"}{" "}
+                        {t.subject?.name ?? "Subject"}{" "}
                         · {formatDate(t.deadlineAt)}
                       </small>
                     </span>
@@ -5183,10 +5074,12 @@ function TestAdmin({ notify }: { notify: (s: string) => void }) {
           )}
         </Card>
       )}
-      {showCreate && (
+      {showCreate && activeTab === "tests" && (
         <CreateTest onClose={() => setShowCreate(false)} notify={notify} />
       )}
       {showPreview && <QuestionPreview onClose={() => setShowPreview(false)} />}
+      </>
+      )}
     </>
   );
 }
@@ -5302,6 +5195,24 @@ async function exportTestSolutions(testTitle: string, assessment: Data) {
   pdf.text("Recognized Solutions", pageWidth / 2, y, { align: "center" });
   y += 13;
 
+  const solutionOverview = [
+    "| Question | Marks available |",
+    "| --- | ---: |",
+    ...questions.map(
+      (question) =>
+        `| ${question.questionNumber ?? "—"} | ${question.marksAvailable ?? "—"} |`,
+    ),
+  ].join("\n");
+  y = addPdfFormattedContent(pdf, solutionOverview, {
+    x: margin,
+    width: pageWidth - margin * 2,
+    y,
+    bottom: contentBottom,
+    addPage: () => pdf.addPage(),
+    fontSize: 10,
+  });
+  y += 8;
+
   for (const question of questions) {
     if (y + 14 > contentBottom) {
       pdf.addPage();
@@ -5391,6 +5302,44 @@ async function exportDeficiencyReport(
   pdf.text("Assessment feedback report", margin, 24);
   y = 43;
 
+  const reportQuestions = asArray<Data>(assessment.questions);
+  if (reportQuestions.length) {
+    const awardedTotal = reportQuestions.reduce(
+      (sum, question) => sum + Number(question.marksAwarded ?? 0),
+      0,
+    );
+    const availableTotal = reportQuestions.reduce(
+      (sum, question) => sum + Number(question.marksAvailable ?? 0),
+      0,
+    );
+    const scoreSummary = [
+      "| Question | Score | Result |",
+      "| --- | ---: | ---: |",
+      ...reportQuestions.map((question) => {
+        const awarded = Number(question.marksAwarded ?? 0);
+        const available = Number(question.marksAvailable ?? 0);
+        const percentage =
+          available > 0 ? `${((awarded / available) * 100).toFixed(1)}%` : "—";
+        return `| ${question.questionNumber ?? "—"} | ${awarded} / ${available} | ${percentage} |`;
+      }),
+      `| Total | ${awardedTotal} / ${availableTotal} | ${
+        availableTotal > 0
+          ? `${((awardedTotal / availableTotal) * 100).toFixed(1)}%`
+          : "—"
+      } |`,
+    ].join("\n");
+    heading("Score summary");
+    y = addPdfFormattedContent(pdf, scoreSummary, {
+      x: margin + 2,
+      width: pageWidth - margin * 2 - 4,
+      y,
+      bottom,
+      addPage,
+      fontSize: 9,
+    });
+    y += 7;
+  }
+
   if (assessment.deficiencyReport || fallbackReport) {
     heading("Overall feedback");
     pdf.setFont("helvetica", "normal");
@@ -5404,7 +5353,7 @@ async function exportDeficiencyReport(
     y += 7;
   }
 
-  for (const question of asArray<Data>(assessment.questions)) {
+  for (const question of reportQuestions) {
     heading(
       `Question ${question.questionNumber}`,
       `${question.marksAwarded ?? 0} / ${question.marksAvailable ?? 0} marks`,
@@ -6006,7 +5955,9 @@ function AttemptReview({
               </p>
             </div>
             <div className="button-row">
-              {String(selectedAttempt.status).toUpperCase() === "FAILED" && (
+              {selectedAttempt.submittedAt &&
+                String(selectedAttempt.status).toUpperCase() !== "COMPLETED" &&
+                !selectedAttempt.aiAssessment && (
                 <button
                   className="button secondary small-button"
                   disabled={retryBusy}
@@ -6260,9 +6211,9 @@ function CreateTest({
   onClose: () => void;
   notify: (s: string) => void;
 }) {
-  const [folderId, setFolderId] = useState("");
-  const { data: folderData } = useResource<unknown[]>("/folders");
-  const folders = asArray<Data>(folderData);
+  const [subjectId, setSubjectId] = useState("");
+  const { data: subjectData } = useResource<unknown[]>("/subjects/list");
+  const subjects = asArray<Data>(subjectData);
   const [title, setTitle] = useState(""),
     [description, setDescription] = useState(""),
     [date, setDate] = useState(""),
@@ -6361,7 +6312,7 @@ function CreateTest({
   async function submit(e: FormEvent) {
     e.preventDefault();
     setError("");
-    if (!folderId) {
+    if (!subjectId) {
       setError("Choose a subject for this test.");
       return;
     }
@@ -6447,7 +6398,7 @@ function CreateTest({
           title,
           description,
           totalMarks: marksSum,
-          folderIds: [folderId],
+          subjectId,
           ...(date ? { testDate: new Date(date).toISOString() } : {}),
           deadlineAt: new Date(deadline).toISOString(),
           questions: questionPayload,
@@ -6513,11 +6464,11 @@ function CreateTest({
             Subject
             <select
               required
-              value={folderId}
-              onChange={(e) => setFolderId(e.target.value)}
+              value={subjectId}
+              onChange={(e) => setSubjectId(e.target.value)}
             >
               <option value="">Choose subject</option>
-              {folders.map((f) => (
+              {subjects.map((f) => (
                 <option key={getId(f)} value={getId(f)}>
                   {getTitle(f)}
                 </option>
@@ -6732,7 +6683,12 @@ function CreateTest({
   );
 }
 function Queries({ admin }: { admin: boolean }) {
-  const { data, error, loading } = useResource<unknown[]>("/student-queries");
+  const {
+    data,
+    error,
+    loading,
+    refresh: refreshQueries,
+  } = useResource<unknown[]>("/student-queries");
   const rows = asArray<Data>(data);
   const [title, setTitle] = useState(""),
     [message, setMessage] = useState(""),
@@ -6747,6 +6703,7 @@ function Queries({ admin }: { admin: boolean }) {
       setNotice("Your query was sent.");
       setTitle("");
       setMessage("");
+      refreshQueries();
     } catch (ex) {
       setNotice(ex instanceof Error ? ex.message : "Could not send query.");
     }
@@ -6754,13 +6711,14 @@ function Queries({ admin }: { admin: boolean }) {
   async function sendReply() {
     if (!active) return;
     try {
-      await api(
+      const updatedQuery = await api<Data>(
         `/student-queries/${getId(active)}/reply`,
         json("POST", { response: reply }),
       );
       setNotice("Reply submitted.");
-      setActive(null);
+      setActive(updatedQuery);
       setReply("");
+      refreshQueries();
     } catch (ex) {
       setNotice(ex instanceof Error ? ex.message : "Reply failed.");
     }
@@ -6930,7 +6888,7 @@ function Analytics() {
   const obj = data ?? {};
   const cards = Object.entries(obj)
     .filter(([, v]) => typeof v === "number" || typeof v === "string")
-    .slice(0, 8);
+    .slice(0, 10);
   return (
     <>
       <Heading

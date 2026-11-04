@@ -13,12 +13,14 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 class TestSubmissionService
 {
-    private const MAX_FILES = 10;
+    private const MAX_FILES = 30;
     private const MAX_FILE_BYTES = 30 * 1024 * 1024;
     private const MAX_TOTAL_BYTES = 30 * 1024 * 1024;
 
-    public function __construct(private readonly PrivateFileStorage $storage)
-    {
+    public function __construct(
+        private readonly PrivateFileStorage $storage,
+        private readonly TestAssessmentService $assessment
+    ) {
     }
 
     public function submit(string $testId, string $studentId, mixed $answersInput, mixed $uploads): array
@@ -171,7 +173,6 @@ class TestSubmissionService
                         'mime_type' => $file['mimeType'],
                         'size_bytes' => $file['size'],
                         'storage_key' => $storedKeys[$index],
-                        'file_data' => null,
                         'created_at' => $now,
                     ]);
                 }
@@ -216,10 +217,35 @@ class TestSubmissionService
             }
         }
 
-        return $result;
+        if (array_filter($prepared, static fn (array $file): bool => str_starts_with($file['mimeType'], 'image/')) !== []) {
+            return $result + [
+                'gradingPending' => true,
+                'gradingQueued' => true,
+                'gradingMessage' => 'Your answers were saved. AI is processing the uploaded answer pages; results will appear when grading is complete.',
+            ];
+        }
+
+        try {
+            $assessment = $this->assessment->gradeAttempt($testId, $result['attemptId']);
+
+            return $result + [
+                'gradingPending' => false,
+                'resultAvailableAt' => $assessment['resultAvailableAt'] ?? null,
+            ];
+        } catch (\RuntimeException $error) {
+            $message = str_contains(strtolower($error->getMessage()), 'manual review') ||
+                str_contains(strtolower($error->getMessage()), 'readable answer text')
+                ? 'Your submission was saved, but AI could not read answers from the uploaded file. Upload clearer page images or type answers in the answer boxes; an administrator can also grade it manually.'
+                : 'Your answers were saved, but automated grading could not complete. An administrator can review and retry it.';
+
+            return $result + [
+                'gradingPending' => true,
+                'gradingMessage' => $message,
+            ];
+        }
     }
 
-    public function resubmit(string $testId, string $attemptId, string $studentId): never
+    public function resubmit(string $testId, string $attemptId, string $studentId): array
     {
         $this->requireStudentTestAccess($testId, $studentId);
         if (!Str::isUuid($attemptId)) {
@@ -239,7 +265,11 @@ class TestSubmissionService
             throw new BadRequestHttpException('Only a failed submission with saved answers can be resubmitted.');
         }
 
-        throw new HttpException(503, 'Assessment grading is not available in this deployment.');
+        try {
+            return $this->assessment->gradeAttempt($testId, $attemptId);
+        } catch (\RuntimeException $error) {
+            throw new HttpException(503, $error->getMessage(), $error);
+        }
     }
 
     private function requireStudentTestAccess(string $testId, string $studentId): object
@@ -251,15 +281,14 @@ class TestSubmissionService
         if (!$test) {
             throw new NotFoundHttpException('Test not found');
         }
-        $hasAccess = DB::table('test_folders as tf')
-            ->join('folder_permissions as fp', 'fp.folderId', '=', 'tf.folderId')
-            ->where('tf.testId', $testId)
-            ->where('fp.userId', $studentId)
-            ->where('fp.canView', true)
-            ->where('fp.billing_suspended', false)
-            ->exists();
-        if (!$hasAccess) {
-            throw new AccessDeniedHttpException('No active folder access for this test.');
+        if (!DB::table('users')->where('id', $studentId)->where('role', 'student')->exists()) {
+            throw new AccessDeniedHttpException('Student account required.');
+        }
+        if (!DB::table('subject_user_access')
+            ->where('user_id', $studentId)
+            ->where('subject_id', $test->subject_id)
+            ->exists()) {
+            throw new AccessDeniedHttpException('You do not have access to this test subject.');
         }
 
         return $test;
@@ -375,6 +404,7 @@ class TestSubmissionService
                 throw new BadRequestHttpException("{$name}: invalid DOCX file.");
             }
 
+            $questionPageMatch = preg_match('/^question-(\d+)-page-(\d+)\.[^.]+$/i', $name, $questionPage);
             $questionMatch = preg_match('/^question-(\d+)\.[^.]+$/i', $name, $question);
             $pageMatch = preg_match('/^paper-page-(\d+)\.[^.]+$/i', $name, $page);
             $paper = preg_match('/^paper\.(pdf|docx|txt|jpg|jpeg|png|webp)$/i', $name) === 1;
@@ -389,6 +419,17 @@ class TestSubmissionService
                 $seen["question-{$questionNumber}"] = true;
                 $category = 'question';
                 $pageNumber = null;
+            } elseif ($questionPageMatch === 1 && $isImage) {
+                $questionNumber = (int) $questionPage[1];
+                $pageNumber = (int) $questionPage[2];
+                if (!in_array($questionNumber, $questionNumbers, true)) {
+                    throw new BadRequestHttpException("File refers to unknown question {$questionNumber}.");
+                }
+                if ($pageNumber < 1 || $pageNumber > 30 || isset($seen["question-{$questionNumber}-page-{$pageNumber}"])) {
+                    throw new BadRequestHttpException('Question answer page numbers must be unique and between 1 and 30.');
+                }
+                $seen["question-{$questionNumber}-page-{$pageNumber}"] = true;
+                $category = 'question';
             } elseif ($pageMatch === 1 && $isImage) {
                 $pageNumber = (int) $page[1];
                 if ($pageNumber < 1 || $pageNumber > 30 || isset($seen["page-{$pageNumber}"])) {

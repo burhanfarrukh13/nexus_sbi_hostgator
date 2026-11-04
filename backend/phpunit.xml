@@ -16,9 +16,12 @@
         <env name="JWT_ACCESS_SECRET" value="test-access-secret-at-least-thirty-two-characters"/>
         <env name="JWT_REFRESH_SECRET" value="test-refresh-secret-at-least-thirty-two-characters"/>
         <env name="STORAGE_SIGNING_SECRET" value="test-storage-secret-at-least-thirty-two-characters"/>
-        <env name="EMBEDDINGS_API_URL" value="https://embeddings.example.test/v1/embeddings"/>
-        <env name="EMBEDDINGS_API_KEY" value="test-key"/>
-        <env name="EMBEDDINGS_MODEL" value="test-model"/>
-        <env name="EMBEDDINGS_DIMENSIONS" value="3"/>
+        <env name="OPENROUTER_EMBEDDINGS_API_URL" value="https://openrouter.example.test/api/v1/embeddings"/>
+        <env name="OPENROUTER_API_KEY" value="test-key"/>
+        <env name="OPENROUTER_EMBEDDINGS_MODEL" value="test-model"/>
+        <env name="OPENROUTER_EMBEDDINGS_DIMENSIONS" value="3"/>
+        <env name="OLLAMA_API_URL" value="https://ollama.example.test/v1/chat/completions"/>
+        <env name="OLLAMA_API_KEY" value="test-key"/>
+        <env name="OLLAMA_MODEL" value="test-model"/>
     </php>
 </phpunit>

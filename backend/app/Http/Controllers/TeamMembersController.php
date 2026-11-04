@@ -43,7 +43,7 @@ class TeamMembersController
     {
         $this->validateUuid($userId);
         $input = $this->validateRequest($request, [
-            'permissions' => ['required', 'array', 'max:12'],
+            'permissions' => ['present', 'array', 'max:12'],
             'permissions.*' => ['required', 'string', 'distinct', Rule::in($this->allowedPermissions())],
         ]);
         $this->validateAllowedPortalPermissions($input['permissions']);
@@ -96,16 +96,10 @@ class TeamMembersController
         return [
             'admin',
             'teacher_assistant',
-            'folder_manager',
             'user_manager',
             'password_manager',
-            'accountant',
-            'accountant_fees',
-            'accountant_payments',
-            'accountant_expenses',
-            'accountant_reports',
-            'student_query',
             'testing_manager',
+            'student_query',
         ];
     }
 
@@ -114,11 +108,10 @@ class TeamMembersController
         $available = [
             'admin',
             'teacher_assistant',
-            'folder_manager',
             'user_manager',
             'password_manager',
-            'student_query',
             'testing_manager',
+            'student_query',
         ];
         $unsupported = array_values(array_diff($permissions, $available));
         if ($unsupported !== []) {

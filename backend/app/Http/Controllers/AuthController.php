@@ -7,7 +7,6 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
-use Symfony\Component\HttpKernel\Exception\ConflictHttpException;
 use Symfony\Component\HttpKernel\Exception\UnauthorizedHttpException;
 use Throwable;
 
@@ -24,24 +23,13 @@ class AuthController
         ]);
         $input = $request->validate([
             'email' => ['required', 'string', 'email', 'min:3', 'max:254'],
-            'password' => ['required', 'string', 'min:8', 'max:200'],
-            'deviceFingerprint' => ['sometimes', 'nullable', 'regex:/^[0-9a-f]{16,128}$/i'],
+            'password' => ['required', 'string', 'min:7', 'max:200'],
         ]);
         $email = $input['email'];
         $user = DB::table('users')->whereRaw('LOWER(email) = ?', [$email])->first();
 
         if (!$user || $user->disabled_at !== null || !Hash::check($input['password'], $user->password)) {
             throw new UnauthorizedHttpException('', 'Invalid credentials');
-        }
-
-        $fingerprint = $input['deviceFingerprint'] ?? null;
-        if ($user->role === 'student' && !$this->studentDeviceAllowed($user->id, $fingerprint)) {
-            if (!$fingerprint) {
-                abort(426, 'Please update Nexus to verify this device before signing in.');
-            }
-            throw new ConflictHttpException(
-                'This account is already registered to another device. Ask your school administrator to release the current device before signing in here.'
-            );
         }
 
         return response()->json(
@@ -55,7 +43,6 @@ class AuthController
         $input = $request->validate([
             'userId' => ['required', 'string', 'uuid'],
             'refreshToken' => ['required', 'string', 'min:20', 'max:4096'],
-            'deviceFingerprint' => ['sometimes', 'nullable', 'regex:/^[0-9a-f]{16,128}$/i'],
         ]);
 
         try {
@@ -74,11 +61,6 @@ class AuthController
             if (!$user || $user->disabled_at !== null) {
                 return ['error' => 'User not found'];
             }
-            if ($user->role === 'student' &&
-                !$this->studentDeviceRegistered($user->id, $input['deviceFingerprint'] ?? null)) {
-                return ['error' => 'Refresh requires the registered device.'];
-            }
-
             $digest = hash('sha256', $input['refreshToken']);
             if (is_string($user->refreshTokenHash) && hash_equals($user->refreshTokenHash, $digest)) {
                 return $this->rotateTokens($user, false);
@@ -196,23 +178,6 @@ class AuthController
                 'mustResetPassword' => (bool) $user->must_reset_password,
             ],
         ];
-    }
-
-    private function studentDeviceAllowed(string $userId, ?string $fingerprint): bool
-    {
-        $active = DB::table('devices')->where('userId', $userId)->where('isActive', true)->first();
-
-        return !$active || ($fingerprint && $active->deviceFingerprint &&
-            mb_strtolower($fingerprint) === mb_strtolower($active->deviceFingerprint));
-    }
-
-    private function studentDeviceRegistered(string $userId, ?string $fingerprint): bool
-    {
-        return $fingerprint !== null && DB::table('devices')
-            ->where('userId', $userId)
-            ->where('isActive', true)
-            ->whereRaw('LOWER(deviceFingerprint) = ?', [mb_strtolower($fingerprint)])
-            ->exists();
     }
 
     private function durationSeconds(string $duration): int

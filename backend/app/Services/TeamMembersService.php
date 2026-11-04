@@ -17,11 +17,10 @@ class TeamMembersService
     private const WEB_PERMISSIONS = [
         'admin',
         'teacher_assistant',
-        'folder_manager',
         'user_manager',
         'password_manager',
-        'student_query',
         'testing_manager',
+        'student_query',
     ];
 
     public function list(): array

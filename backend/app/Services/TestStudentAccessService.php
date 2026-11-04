@@ -13,16 +13,18 @@ class TestStudentAccessService
 {
     public function listMyAttempts(string $studentId): array
     {
+        if (!DB::table('users')->where('id', $studentId)->where('role', 'student')->exists()) {
+            throw new AccessDeniedHttpException('Student account required.');
+        }
+        $subjectIds = DB::table('subject_user_access')
+            ->where('user_id', $studentId)
+            ->pluck('subject_id');
+        if ($subjectIds->isEmpty()) {
+            return [];
+        }
+
         $tests = DB::table('tests')
-            ->whereExists(function ($query) use ($studentId): void {
-                $query->selectRaw('1')
-                    ->from('test_folders as tf')
-                    ->join('folder_permissions as fp', 'fp.folderId', '=', 'tf.folderId')
-                    ->whereColumn('tf.testId', 'tests.id')
-                    ->where('fp.userId', $studentId)
-                    ->where('fp.canView', true)
-                    ->where('fp.billing_suspended', false);
-            })
+            ->whereIn('subject_id', $subjectIds)
             ->orderByDesc('createdAt')
             ->get();
 
@@ -80,16 +82,7 @@ class TestStudentAccessService
             ->first();
 
         $questions = $this->decodeJson($test->questions, []);
-        $contentIds = array_values(array_filter($this->decodeJson($test->contentCovered, [])));
-        $lectures = $contentIds === []
-            ? []
-            : DB::table('lectures')
-                ->whereIn('id', $contentIds)
-                ->get(['id', 'title', 'duration'])
-                ->map(static fn (object $lecture): array => (array) $lecture)
-                ->all();
-
-        $released = $attempt !== null && $attempt->marksObtained !== null;
+        $released = $this->resultIsReleased($attempt);
         $studentQuestions = array_map(static function (array $question) use ($released): array {
             $safe = [
                 'questionNumber' => $question['questionNumber'] ?? null,
@@ -139,7 +132,7 @@ class TestStudentAccessService
             'totalMarks' => (string) $test->totalMarks,
             'deadlineAt' => $this->isoDate($test->deadline_at),
             'questions' => $studentQuestions,
-            'lectures' => $lectures,
+            'lectures' => [],
             'attempt' => $this->studentAttemptView($attempt, $questions, $attemptFiles),
             'solutionSourceFiles' => $solutionSourceFiles,
             'effectiveDeadlineAt' => $this->isoDate($attempt->deadline_override_at ?? $test->deadline_at ?? null),
@@ -213,16 +206,15 @@ class TestStudentAccessService
         if (!$test) {
             throw new NotFoundHttpException('Test not found');
         }
-
-        $hasAccess = DB::table('test_folders as tf')
-            ->join('folder_permissions as fp', 'fp.folderId', '=', 'tf.folderId')
-            ->where('tf.testId', $testId)
-            ->where('fp.userId', $studentId)
-            ->where('fp.canView', true)
-            ->where('fp.billing_suspended', false)
-            ->exists();
-        if (!$hasAccess) {
-            throw new AccessDeniedHttpException('No active folder access for this test.');
+        $student = DB::table('users')->where('id', $studentId)->where('role', 'student')->exists();
+        if (!$student) {
+            throw new AccessDeniedHttpException('Student account required.');
+        }
+        if (!DB::table('subject_user_access')
+            ->where('user_id', $studentId)
+            ->where('subject_id', $test->subject_id)
+            ->exists()) {
+            throw new AccessDeniedHttpException('You do not have access to this test subject.');
         }
 
         return $test;
@@ -234,7 +226,8 @@ class TestStudentAccessService
             return null;
         }
         $marksObtained = $attempt->marksObtained;
-        $released = $marksObtained !== null;
+        $released = $this->resultIsReleased($attempt);
+        $underMarking = $attempt->submitted_at !== null && !$released;
         $assessment = $this->decodeJson($attempt->ai_assessment, []);
         if ($released && isset($assessment['questions']) && is_array($assessment['questions'])) {
             $assessment['questions'] = array_map(static function (array $result) use ($questions): array {
@@ -253,15 +246,18 @@ class TestStudentAccessService
 
         return [
             'id' => $attempt->id,
-            'status' => $attempt->status,
+            'status' => $underMarking ? 'SUBMITTED' : $attempt->status,
             'appeared' => (bool) $attempt->appeared,
             'submittedAt' => $this->isoDate($attempt->submitted_at),
+            'isResultReleased' => $released,
+            'gradingComplete' => $marksObtained !== null,
+            'resultAvailableAt' => $this->isoDate($attempt->result_available_at),
             'submissionMode' => $attempt->submission_mode,
             'submittedAnswers' => $this->decodeJson($attempt->submitted_answers, null),
             'files' => $files,
             'reviewNote' => $attempt->review_note,
             'reviewSubmittedAt' => $this->isoDate($attempt->review_submitted_at),
-            'marksObtained' => $marksObtained,
+            'marksObtained' => $released ? $marksObtained : null,
             'deficiencyNotes' => $released ? $attempt->deficiencyNotes : null,
             'aiAssessment' => $released && $assessment !== [] ? $assessment : null,
             'gradingError' => $attempt->grading_error
@@ -270,6 +266,16 @@ class TestStudentAccessService
             'reviewResolution' => $attempt->review_resolution,
             'reviewResolvedAt' => $this->isoDate($attempt->review_resolved_at),
         ];
+    }
+
+    private function resultIsReleased(?object $attempt): bool
+    {
+        if ($attempt === null || $attempt->marksObtained === null) {
+            return false;
+        }
+
+        return $attempt->result_available_at === null ||
+            Carbon::parse($attempt->result_available_at)->lessThanOrEqualTo(now());
     }
 
     private function decodeJson(mixed $value, mixed $default): mixed

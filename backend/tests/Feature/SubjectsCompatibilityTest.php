@@ -13,199 +13,149 @@ class SubjectsCompatibilityTest extends TestCase
 {
     use RefreshDatabase;
 
-    public function test_subject_create_maps_class_creates_folder_and_audits(): void
+    public function test_subjects_are_standalone_and_manage_notebook_and_test_organization(): void
     {
-        $actor = $this->createUser('owner@example.test', ['folder_manager']);
-        [$schoolId, $classId, $sectionId] = $this->createAcademicScope();
+        $admin = $this->createUser('admin@example.test', ['teacher_assistant']);
+        $token = $this->token($admin);
 
-        $response = $this->withToken($this->token($actor))
+        $created = $this->withToken($token)
             ->postJson('/api/subjects', [
-                'schoolId' => $schoolId,
-                'classId' => $classId,
-                'sectionId' => $sectionId,
-                'code' => 'MATH-1',
-                'name' => 'Mathematics',
-                'defaultPrice' => 24.5,
+                'code' => 'BIO-1',
+                'name' => 'Biology',
             ])
             ->assertCreated()
-            ->assertJsonStructure(['id', 'schoolId', 'classId', 'sectionId', 'code', 'name', 'createdAt', 'updatedAt'])
-            ->assertJsonPath('name', 'Mathematics');
+            ->assertJsonStructure(['id', 'code', 'name', 'createdAt', 'updatedAt'])
+            ->assertJsonPath('name', 'Biology');
 
-        $subjectId = $response->json('id');
-        $this->assertDatabaseHas('class_subjects', [
-            'class_id' => $classId,
-            'subject_id' => $subjectId,
-        ]);
-        $this->assertDatabaseHas('folders', [
-            'subject_id' => $subjectId,
-            'name' => 'Mathematics',
-            'default_price' => '24.50',
-        ]);
-        $folderId = DB::table('folders')->where('subject_id', $subjectId)->value('id');
-        $this->withToken($this->token($actor))
-            ->getJson('/api/ai-notebook/folders')
-            ->assertOk()
-            ->assertJsonFragment([
-                'id' => $folderId,
-                'subjectId' => $subjectId,
-            ]);
-        $this->assertDatabaseHas('audit_logs', [
-            'event' => 'subject_created',
-            'details' => 'Mathematics',
-        ]);
-
-        $this->withToken($this->token($actor))
-            ->getJson('/api/subjects/list?schoolId='.$schoolId.'&classId='.$classId.'&sectionId='.$sectionId)
+        $subjectId = $created->json('id');
+        $this->withToken($token)
+            ->getJson('/api/subjects/list')
             ->assertOk()
             ->assertJsonCount(1)
             ->assertJsonPath('0.id', $subjectId);
+
+        $this->withToken($token)
+            ->getJson('/api/ai-notebook/subjects')
+            ->assertOk()
+            ->assertJsonFragment(['id' => $subjectId, 'name' => 'Biology']);
+        $this->withToken($token)
+            ->getJson("/api/ai-notebook/subjects/{$subjectId}/sources")
+            ->assertOk()
+            ->assertExactJson([]);
+        $this->withToken($token)
+            ->putJson("/api/ai-notebook/subjects/{$subjectId}/prompt/default", [
+                'prompt' => 'Use concise explanations.',
+                'responseLanguage' => 'english',
+            ])
+            ->assertOk()
+            ->assertJsonPath('prompt', 'Use concise explanations.');
+        $this->withToken($token)
+            ->getJson("/api/ai-notebook/subjects/{$subjectId}/prompt")
+            ->assertOk()
+            ->assertJsonPath('prompt', 'Use concise explanations.');
+
+        $this->assertDatabaseHas('audit_logs', [
+            'event' => 'notebook_subject_created',
+            'details' => 'Biology',
+        ]);
+
+        $this->withToken($token)
+            ->putJson('/api/subjects/'.$subjectId, ['name' => 'Biology II'])
+            ->assertOk()
+            ->assertJsonPath('name', 'Biology II');
+
+        $this->withToken($token)
+            ->deleteJson('/api/subjects/'.$subjectId)
+            ->assertOk()
+            ->assertJson(['success' => true]);
     }
 
-    public function test_subject_update_mapping_and_teacher_assignment_are_source_shaped(): void
+    public function test_subject_creation_requires_permissions_and_duplicate_codes_are_rejected(): void
     {
-        $actor = $this->createUser('owner@example.test', ['folder_manager']);
-        $teacher = $this->createUser('teacher@example.test', []);
-        [$schoolId, $classId, $sectionId] = $this->createAcademicScope();
-        $subjectId = $this->insertSubject($schoolId, 'ENG-1', 'English');
-        $secondClassId = (string) Str::uuid();
-        DB::table('classes')->insert([
-            'id' => $secondClassId,
-            'school_id' => $schoolId,
-            'numeric_level' => 2,
-            'display_name' => 'Grade 2',
+        $student = $this->createUser('student@example.test', [], 'student');
+        $this->withToken($this->token($student))
+            ->postJson('/api/subjects', ['code' => 'SCI-1', 'name' => 'Science'])
+            ->assertForbidden();
+
+        $admin = $this->createUser('manager@example.test', ['teacher_assistant']);
+        $token = $this->token($admin);
+        $this->withToken($token)
+            ->postJson('/api/subjects', ['code' => 'SCI-1', 'name' => 'Science'])
+            ->assertCreated();
+        $this->withToken($token)
+            ->postJson('/api/subjects', ['code' => 'SCI-1', 'name' => 'Science Duplicate'])
+            ->assertBadRequest()
+            ->assertJsonPath('message', 'A subject with code "SCI-1" already exists.');
+    }
+
+    public function test_student_can_save_personal_notebook_prompt_and_response_language(): void
+    {
+        $student = $this->createUser('prompt-student@example.test', [], 'student');
+        $subjectId = (string) Str::uuid();
+        DB::table('subjects')->insert([
+            'id' => $subjectId,
+            'code' => 'LANG-1',
+            'name' => 'Languages',
             'created_at' => now(),
             'updated_at' => now(),
         ]);
-
-        $token = $this->token($actor);
-        $this->withToken($token)
-            ->putJson('/api/subjects/'.$subjectId, ['name' => 'English Language'])
-            ->assertOk()
-            ->assertJsonPath('name', 'English Language');
-
-        $this->withToken($token)
-            ->postJson('/api/subjects/'.$subjectId.'/map-class', ['classId' => $secondClassId])
-            ->assertCreated()
-            ->assertJson(['ok' => true]);
-        $this->withToken($token)
-            ->getJson('/api/subjects/list?classId='.$secondClassId)
-            ->assertOk()
-            ->assertJsonFragment(['id' => $subjectId]);
-
-        $this->withToken($token)
-            ->postJson('/api/subjects/'.$subjectId.'/assign-teacher', [
-                'classId' => $classId,
-                'sectionId' => $sectionId,
-                'userId' => $teacher,
-            ])
-            ->assertCreated()
-            ->assertJson(['ok' => true]);
-        $this->withToken($token)
-            ->postJson('/api/subjects/'.$subjectId.'/assign-teacher', [
-                'classId' => $classId,
-                'sectionId' => $sectionId,
-                'userId' => $teacher,
-            ])
-            ->assertCreated();
-
-        $this->assertDatabaseCount('subject_teachers', 1);
-        $this->assertDatabaseHas('audit_logs', [
-            'event' => 'subject_teacher_assigned',
-            'details' => $subjectId,
+        DB::table('subject_user_access')->insert([
+            'subject_id' => $subjectId,
+            'user_id' => $student,
+            'created_at' => now(),
         ]);
-    }
+        DB::table('ai_notebook_prompts')->insert([
+            'subject_id' => $subjectId,
+            'prompt' => 'Use the subject default.',
+            'response_language' => 'english',
+            'updated_at' => now(),
+        ]);
 
-    public function test_subject_guards_and_duplicate_code_validation(): void
-    {
-        $owner = $this->createUser('owner@example.test', ['admin']);
-        $teacher = $this->createUser('teacher@example.test', ['teacher_assistant']);
-        [$schoolId, ,] = $this->createAcademicScope();
-        $this->insertSubject($schoolId, 'SCI-1', 'Science');
+        $this->withToken($this->token($student))
+            ->getJson("/api/ai-notebook/subjects/{$subjectId}/prompt")
+            ->assertOk()
+            ->assertJsonPath('prompt', 'Use the subject default.')
+            ->assertJsonPath('responseLanguage', 'english');
+        $this->withToken($this->token($student))
+            ->putJson("/api/ai-notebook/subjects/{$subjectId}/prompt/personal", [
+                'prompt' => 'Explain using simple examples.',
+                'responseLanguage' => 'roman_urdu',
+            ])
+            ->assertOk()
+            ->assertJsonPath('prompt', 'Explain using simple examples.')
+            ->assertJsonPath('responseLanguage', 'roman_urdu');
+        $this->withToken($this->token($student))
+            ->getJson("/api/ai-notebook/subjects/{$subjectId}/prompt")
+            ->assertOk()
+            ->assertJsonPath('prompt', 'Explain using simple examples.')
+            ->assertJsonPath('responseLanguage', 'roman_urdu')
+            ->assertJsonPath('defaultPrompt', 'Use the subject default.');
 
-        $this->withToken($this->token($teacher))
-            ->getJson('/api/subjects/list?schoolId='.$schoolId)
-            ->assertOk();
-        $this->withToken($this->token($teacher))
-            ->postJson('/api/subjects', [
-                'schoolId' => $schoolId,
-                'code' => 'SCI-2',
-                'name' => 'Science 2',
+        $otherStudent = $this->createUser('unassigned@example.test', [], 'student');
+        $this->withToken($this->token($otherStudent))
+            ->putJson("/api/ai-notebook/subjects/{$subjectId}/prompt/personal", [
+                'prompt' => 'Attempt to modify.',
+                'responseLanguage' => 'urdu',
             ])
             ->assertForbidden();
 
-        $this->withToken($this->token($owner))
-            ->postJson('/api/subjects', [
-                'schoolId' => $schoolId,
-                'code' => 'SCI-1',
-                'name' => 'Science Duplicate',
-            ])
-            ->assertBadRequest()
-            ->assertJsonPath('message', 'A subject with code "SCI-1" already exists for this school.');
-
-        $this->withToken($this->token($owner))
-            ->postJson('/api/subjects', [
-                'schoolId' => $schoolId,
-                'code' => 'SCI-2',
-                'name' => 'Science 2',
-                'defaultPrice' => 1.234,
-            ])
-            ->assertBadRequest();
+        self::assertSame(
+            'roman_urdu',
+            DB::table('ai_notebook_user_prompts')
+                ->where('subject_id', $subjectId)
+                ->where('user_id', $student)
+                ->value('response_language')
+        );
     }
 
-    private function createAcademicScope(): array
-    {
-        $schoolId = (string) Str::uuid();
-        DB::table('schools')->insert([
-            'id' => $schoolId,
-            'name' => 'Nexus School',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-        $classId = (string) Str::uuid();
-        DB::table('classes')->insert([
-            'id' => $classId,
-            'school_id' => $schoolId,
-            'numeric_level' => 1,
-            'display_name' => 'Grade 1',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-        $sectionId = (string) Str::uuid();
-        DB::table('sections')->insert([
-            'id' => $sectionId,
-            'class_id' => $classId,
-            'name' => 'A',
-            'capacity' => 40,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return [$schoolId, $classId, $sectionId];
-    }
-
-    private function insertSubject(string $schoolId, string $code, string $name): string
-    {
-        $id = (string) Str::uuid();
-        DB::table('subjects')->insert([
-            'id' => $id,
-            'school_id' => $schoolId,
-            'code' => $code,
-            'name' => $name,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        return $id;
-    }
-
-    private function createUser(string $email, array $permissions): string
+    private function createUser(string $email, array $permissions, string $role = 'admin'): string
     {
         $id = (string) Str::uuid();
         DB::table('users')->insert([
             'id' => $id,
             'email' => $email,
             'password' => Hash::make('current-account-password'),
-            'role' => 'admin',
+            'role' => $role,
             'refreshCounter' => 0,
             'must_reset_password' => false,
             'createdAt' => now(),

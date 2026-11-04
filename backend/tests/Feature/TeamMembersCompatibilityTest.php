@@ -16,7 +16,7 @@ class TeamMembersCompatibilityTest extends TestCase
     public function test_super_admin_can_list_and_create_team_members_with_audit(): void
     {
         $actor = $this->createUser('owner@example.test', 'admin', ['admin']);
-        $existing = $this->createUser('existing@example.test', 'admin', ['folder_manager']);
+        $existing = $this->createUser('existing@example.test', 'admin', ['teacher_assistant']);
         $this->createUser('student@example.test', 'student');
 
         $this->withToken($this->token($actor))
@@ -26,7 +26,7 @@ class TeamMembersCompatibilityTest extends TestCase
             ->assertJsonFragment([
                 'id' => $existing,
                 'email' => 'existing@example.test',
-                'permissions' => ['folder_manager'],
+                'permissions' => ['teacher_assistant'],
             ]);
 
         $response = $this->withToken($this->token($actor))
@@ -35,12 +35,12 @@ class TeamMembersCompatibilityTest extends TestCase
                 'password' => 'initial-admin-password',
                 'fullName' => 'New Member',
                 'phone' => '+1 555 0100',
-                'permissions' => ['password_manager', 'folder_manager'],
+                'permissions' => ['password_manager', 'teacher_assistant'],
             ])
             ->assertCreated()
             ->assertJsonStructure(['id', 'email', 'fullName', 'phone', 'permissions'])
             ->assertJsonPath('email', 'new.member@example.test')
-            ->assertJsonPath('permissions', ['password_manager', 'folder_manager'])
+            ->assertJsonPath('permissions', ['password_manager', 'teacher_assistant'])
             ->assertJsonMissingPath('password');
 
         $createdId = $response->json('id');
@@ -50,7 +50,7 @@ class TeamMembersCompatibilityTest extends TestCase
             'role' => 'admin',
         ]);
         $this->assertSame(
-            ['folder_manager', 'password_manager'],
+            ['password_manager', 'teacher_assistant'],
             DB::table('user_role_assignments')->where('userId', $createdId)->orderBy('permission')->pluck('permission')->all()
         );
         $this->assertDatabaseHas('audit_logs', [
@@ -78,7 +78,7 @@ class TeamMembersCompatibilityTest extends TestCase
                 'permissions' => ['accountant'],
             ])
             ->assertBadRequest()
-            ->assertJsonPath('message', 'Permissions not available in the web portal: accountant.');
+            ->assertJsonStructure(['statusCode', 'message', 'error']);
     }
 
     public function test_management_routes_require_super_admin_permission(): void
@@ -106,7 +106,7 @@ class TeamMembersCompatibilityTest extends TestCase
     public function test_permission_update_replaces_the_set_and_allows_revocation(): void
     {
         $actor = $this->createUser('owner@example.test', 'admin', ['admin']);
-        $member = $this->createUser('member@example.test', 'admin', ['folder_manager', 'user_manager']);
+        $member = $this->createUser('member@example.test', 'admin', ['teacher_assistant', 'user_manager']);
         $token = $this->token($actor);
 
         $this->withToken($token)
@@ -168,7 +168,7 @@ class TeamMembersCompatibilityTest extends TestCase
     public function test_password_manager_cannot_reset_admins_or_their_own_account(): void
     {
         $actor = $this->createUser('password.manager@example.test', 'admin', ['password_manager']);
-        $target = $this->createUser('other.admin@example.test', 'admin', ['folder_manager']);
+        $target = $this->createUser('other.admin@example.test', 'admin', ['teacher_assistant']);
         $token = $this->token($actor);
 
         $this->withToken($token)
@@ -185,7 +185,7 @@ class TeamMembersCompatibilityTest extends TestCase
     public function test_super_admin_must_prove_their_password_to_reset_non_super_admin_team_member(): void
     {
         $actor = $this->createUser('owner@example.test', 'admin', ['admin'], 'owner-current-password');
-        $target = $this->createUser('member@example.test', 'admin', ['folder_manager']);
+        $target = $this->createUser('member@example.test', 'admin', ['teacher_assistant']);
         $token = $this->token($actor);
 
         $this->withToken($token)

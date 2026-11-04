@@ -51,7 +51,7 @@ class CloudEmbeddingClientTest extends TestCase
         Http::fake(['embeddings.example.test/*' => Http::response(['error' => 'rejected'], 401)]);
 
         $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Cloud embedding provider rejected the request.');
+        $this->expectExceptionMessage('OpenRouter embedding provider rejected the request.');
         app(CloudEmbeddingClient::class)->embed(['sensitive input']);
     }
 
@@ -62,7 +62,7 @@ class CloudEmbeddingClientTest extends TestCase
         });
 
         $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Cloud embedding provider is unavailable.');
+        $this->expectExceptionMessage('OpenRouter embedding provider is unavailable.');
         app(CloudEmbeddingClient::class)->embed(['sensitive input']);
     }
 
@@ -71,7 +71,7 @@ class CloudEmbeddingClientTest extends TestCase
         Http::fake(['embeddings.example.test/*' => Http::response(['data' => 'invalid'])]);
 
         $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Cloud embedding provider returned an invalid response.');
+        $this->expectExceptionMessage('OpenRouter returned an invalid embedding response.');
         app(CloudEmbeddingClient::class)->embed(['text']);
     }
 }

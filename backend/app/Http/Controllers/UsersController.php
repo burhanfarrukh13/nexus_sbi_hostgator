@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Services\UsersService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
@@ -34,21 +35,56 @@ class UsersController
 
     public function store(Request $request): JsonResponse
     {
-        $input = $this->validateBody($request, [
-            'email' => ['required', 'string', 'email:rfc', 'min:3', 'max:254'],
-            'password' => ['required', 'string', 'min:12', 'max:200'],
+        $roleInput = $this->validateBody($request, [
             'role' => ['sometimes', 'nullable', 'in:student,admin'],
         ]);
+        $role = $roleInput['role'] ?? 'student';
         $identity = $request->attributes->get('apiIdentity');
-        $role = $input['role'] ?? 'student';
         if ($role !== 'student' && !in_array('admin', $identity['adminPermissions'] ?? [], true)) {
             throw new AccessDeniedHttpException('Only super admins can create admin accounts');
         }
 
+        if ($role === 'student') {
+            $input = $this->validateBody($request, [
+                'email' => ['required', 'string', 'email:rfc', 'min:3', 'max:254', Rule::unique('users', 'email')],
+                'fullName' => ['required', 'string', 'min:2', 'max:200'],
+                'phone' => ['required', 'string', 'min:7', 'max:32'],
+                'crn' => ['required', 'string', 'min:1', 'max:32', Rule::unique('users', 'studentId')],
+                'subjectIds' => ['sometimes', 'array', 'max:100'],
+                'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
+            ]);
+
+            return response()->json(
+                $this->users->createStudent($input, (string) $identity['userId']),
+                201
+            );
+        }
+
+        $input = $this->validateBody($request, [
+            'email' => ['required', 'string', 'email:rfc', 'min:3', 'max:254', Rule::unique('users', 'email')],
+            'password' => ['required', 'string', 'min:12', 'max:200'],
+            'fullName' => ['sometimes', 'nullable', 'string', 'min:2', 'max:200'],
+        ]);
+
         return response()->json(
-            $this->users->createUser($input['email'], $input['password'], $role),
+            $this->users->createUser($input['email'], $input['password'], $role, $input['fullName'] ?? null),
             201
         );
+    }
+
+    public function updateSubjects(Request $request, string $userId): JsonResponse
+    {
+        $this->validateUuid($userId);
+        $input = $this->validateBody($request, [
+            'subjectIds' => ['present', 'array', 'max:100'],
+            'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
+        ]);
+
+        return response()->json($this->users->updateStudentSubjects(
+            $userId,
+            $input['subjectIds'],
+            (string) $request->attributes->get('apiIdentity')['userId']
+        ));
     }
 
     public function search(Request $request): JsonResponse
@@ -78,5 +114,12 @@ class UsersController
         }
 
         return $validator->validated();
+    }
+
+    private function validateUuid(string $id): void
+    {
+        if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $id)) {
+            throw new BadRequestHttpException('Validation failed (uuid is expected)');
+        }
     }
 }

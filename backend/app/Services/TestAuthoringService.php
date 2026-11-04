@@ -33,13 +33,9 @@ class TestAuthoringService
             throw new AccessDeniedHttpException('Missing permission: teacher_assistant or admin');
         }
 
-        $folderIds = $data['folderIds'] ?? [];
-        if ($folderIds === []) {
-            throw new BadRequestHttpException('Select at least one course folder for this test.');
-        }
-        $folders = DB::table('folders')->whereIn('id', $folderIds)->get();
-        if ($folders->count() !== count($folderIds)) {
-            throw new BadRequestHttpException('One or more folderIds do not exist');
+        $subjectId = (string) ($data['subjectId'] ?? '');
+        if (!Str::isUuid($subjectId) || !DB::table('subjects')->where('id', $subjectId)->exists()) {
+            throw new BadRequestHttpException('Select a valid notebook subject for this test.');
         }
         $totalMarks = (float) $data['totalMarks'];
         if (!$this->validMark($totalMarks) || $totalMarks < 0.01 || $totalMarks > 10000) {
@@ -61,7 +57,7 @@ class TestAuthoringService
         $id = (string) Str::uuid();
         $now = now();
         try {
-            DB::transaction(function () use ($data, $questions, $folderIds, $actorId, $totalMarks, $id, $now): void {
+            DB::transaction(function () use ($data, $questions, $subjectId, $actorId, $totalMarks, $id, $now): void {
                 DB::table('tests')->insert([
                     'id' => $id,
                     'title' => trim($data['title']),
@@ -73,15 +69,10 @@ class TestAuthoringService
                     'deadline_at' => empty($data['deadlineAt']) ? null : Carbon::parse($data['deadlineAt']),
                     'questions' => json_encode($questions, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
                     'createdById' => $actorId,
-                    'classId' => $data['classId'] ?? null,
-                    'sectionId' => $data['sectionId'] ?? null,
-                    'contentCovered' => json_encode($data['contentCovered'] ?? [], JSON_THROW_ON_ERROR),
+                    'subject_id' => $subjectId,
                     'createdAt' => $now,
                     'updatedAt' => $now,
                 ]);
-                foreach ($folderIds as $folderId) {
-                    DB::table('test_folders')->insert(['testId' => $id, 'folderId' => $folderId]);
-                }
             });
         } catch (QueryException $exception) {
             throw $exception;
@@ -168,14 +159,7 @@ class TestAuthoringService
 
     private function testView(object $test): array
     {
-        $folders = DB::table('test_folders as tf')
-            ->join('folders as f', 'f.id', '=', 'tf.folderId')
-            ->where('tf.testId', $test->id)
-            ->orderBy('f.name')
-            ->get([
-                'f.id', 'f.name', 'f.description', 'f.default_price as defaultPrice',
-                'f.coverImageUrl', 'f.subject_id as subjectId', 'f.createdAt', 'f.updatedAt',
-            ])->map(fn (object $folder): array => (array) $folder)->all();
+        $subject = DB::table('subjects')->where('id', $test->subject_id)->first();
 
         $createdBy = null;
         if (!empty($test->createdById)) {
@@ -204,50 +188,18 @@ class TestAuthoringService
             'totalMarks' => number_format((float) $test->totalMarks, 2, '.', ''),
             'deadlineAt' => $test->deadline_at,
             'questions' => $this->decodeJson($test->questions, []),
-            'classId' => $test->classId,
-            'sectionId' => $test->sectionId,
+            'subjectId' => $test->subject_id,
             'createdById' => $test->createdById,
-            'contentCovered' => $this->decodeJson($test->contentCovered, []),
             'createdAt' => $test->createdAt,
             'updatedAt' => $test->updatedAt,
-            'folders' => $folders,
+            'subject' => $subject ? [
+                'id' => $subject->id,
+                'code' => $subject->code,
+                'name' => $subject->name,
+            ] : null,
             'createdBy' => $createdBy,
-            'class' => $this->classView($test->classId),
-            'section' => $this->sectionView($test->sectionId),
             'sourceFiles' => $this->sourceFiles($test->id),
         ];
-    }
-
-    private function classView(?string $classId): ?array
-    {
-        if (!$classId) {
-            return null;
-        }
-        $class = DB::table('classes')->where('id', $classId)->first();
-        return $class ? [
-            'id' => $class->id,
-            'schoolId' => $class->school_id,
-            'numericLevel' => $class->numeric_level,
-            'displayName' => $class->display_name,
-            'createdAt' => $class->created_at,
-            'updatedAt' => $class->updated_at,
-        ] : null;
-    }
-
-    private function sectionView(?string $sectionId): ?array
-    {
-        if (!$sectionId) {
-            return null;
-        }
-        $section = DB::table('sections')->where('id', $sectionId)->first();
-        return $section ? [
-            'id' => $section->id,
-            'classId' => $section->class_id,
-            'name' => $section->name,
-            'capacity' => $section->capacity,
-            'createdAt' => $section->created_at,
-            'updatedAt' => $section->updated_at,
-        ] : null;
     }
 
     private function sourceFiles(string $testId): array
