@@ -9,14 +9,19 @@ use App\Services\TestAssessmentService;
 use App\Services\TestStudentAccessService;
 use App\Services\TestSubmissionService;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Str;
+use RuntimeException;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 
 class TestsController
 {
@@ -60,6 +65,24 @@ class TestsController
         );
     }
 
+    public function statusForStudent(Request $request, string $id): JsonResponse|\Illuminate\Http\Response
+    {
+        $status = $this->studentAccess->getStatusForStudent(
+            $id,
+            (string) $request->attributes->get('apiIdentity')['userId']
+        );
+        $etag = '"'.hash('sha256', json_encode($status, JSON_THROW_ON_ERROR)).'"';
+        $headers = [
+            'ETag' => $etag,
+            'Cache-Control' => 'private, no-cache, must-revalidate',
+        ];
+        if (trim((string) $request->header('If-None-Match')) === $etag) {
+            return response('', 304, $headers);
+        }
+
+        return response()->json($status, 200, $headers);
+    }
+
     public function requestAccess(Request $request, string $id): JsonResponse
     {
         return response()->json(
@@ -77,8 +100,18 @@ class TestsController
             $id,
             (string) $request->attributes->get('apiIdentity')['userId'],
             $request->input('answers', '[]'),
-            $request->file('files', [])
+            $request->file('files', []),
+            $request->input('clientSubmissionId')
         ), 201);
+    }
+
+    public function saveDraft(Request $request, string $id): JsonResponse
+    {
+        return response()->json($this->submissions->saveDraft(
+            $id,
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            $request->input('answers', '[]')
+        ));
     }
 
     public function resubmit(Request $request, string $id, string $attemptId): JsonResponse
@@ -88,6 +121,179 @@ class TestsController
             $attemptId,
             (string) $request->attributes->get('apiIdentity')['userId']
         ));
+    }
+
+    public function submitReview(Request $request, string $id): JsonResponse
+    {
+        $input = $request->validate([
+            'note' => ['required', 'string', 'min:1', 'max:4000'],
+        ]);
+
+        return response()->json($this->studentAccess->submitReview(
+            $id,
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            trim($input['note'])
+        ), 201);
+    }
+
+    public function storeSourceFiles(Request $request, string $testId, PrivateFileStorage $storage): JsonResponse
+    {
+        if (!Str::isUuid($testId) || !DB::table('tests')->where('id', $testId)->exists()) {
+            return response()->json(['message' => 'Test not found.'], 404);
+        }
+        $files = $request->file('files', []);
+        if (!is_array($files) || count($files) < 1 || count($files) > 10) {
+            throw new BadRequestHttpException('Upload between 1 and 10 PDF or DOCX source files.');
+        }
+        $totalBytes = 0;
+        foreach ($files as $file) {
+            if (!$file instanceof UploadedFile || !$file->isValid()) {
+                throw new BadRequestHttpException('A source file could not be uploaded.');
+            }
+            $size = (int) $file->getSize();
+            $totalBytes += $size;
+            if ($size < 1 || $size > 30 * 1024 * 1024) {
+                throw new BadRequestHttpException('Each source file must be between 1 byte and 30 MiB.');
+            }
+            if (!in_array(strtolower($file->getClientOriginalExtension()), ['pdf', 'docx'], true)) {
+                throw new BadRequestHttpException('Only PDF and DOCX source files are supported.');
+            }
+        }
+        if ($totalBytes > 100 * 1024 * 1024) {
+            throw new BadRequestHttpException('Combined source files may not exceed 100 MiB.');
+        }
+
+        $keys = [];
+        try {
+            foreach ($files as $index => $file) {
+                $bytes = file_get_contents($file->getRealPath());
+                if (!is_string($bytes)) {
+                    throw new BadRequestHttpException('A source file could not be read.');
+                }
+                $extension = strtolower($file->getClientOriginalExtension());
+                if (($extension === 'pdf' && !str_contains(substr($bytes, 0, 1024), '%PDF-')) ||
+                    ($extension === 'docx' && !str_starts_with($bytes, 'PK'))) {
+                    throw new BadRequestHttpException($file->getClientOriginalName().': invalid document file.');
+                }
+                $keys[$index] = $storage->store($file, 'test-sources');
+            }
+            DB::transaction(function () use ($testId, $files, $keys): void {
+                $createdAt = now();
+                foreach ($files as $index => $file) {
+                    DB::table('test_source_files')->insert([
+                        'id' => (string) Str::uuid(),
+                        'test_id' => $testId,
+                        'original_name' => mb_substr(basename($file->getClientOriginalName()), 0, 255),
+                        'mime_type' => $file->getMimeType() ?: $file->getClientMimeType(),
+                        'size_bytes' => (int) $file->getSize(),
+                        'storage_key' => $keys[$index],
+                        'created_at' => $createdAt->copy()->addSeconds($index),
+                    ]);
+                }
+            });
+        } catch (\Throwable $error) {
+            foreach ($keys as $key) {
+                try {
+                    $storage->delete($key);
+                } catch (\Throwable) {
+                }
+            }
+            throw $error;
+        }
+
+        return response()->json([
+            'sourceFiles' => $this->sourceFilesForTest($testId),
+        ], 201);
+    }
+
+    public function downloadSourceFile(string $testId, string $fileId, PrivateFileStorage $storage): JsonResponse|StreamedResponse
+    {
+        $file = DB::table('test_source_files')
+            ->where('test_id', $testId)
+            ->where('id', $fileId)
+            ->first();
+        if (!$file || !is_string($file->storage_key)) {
+            return response()->json(['message' => 'Source file not found.'], 404);
+        }
+        try {
+            $path = $storage->resolve($file->storage_key);
+        } catch (RuntimeException) {
+            return response()->json(['message' => 'Source file is unavailable.'], 404);
+        }
+        if (!is_file($path)) {
+            return response()->json(['message' => 'Source file is unavailable.'], 404);
+        }
+
+        return response()->streamDownload(
+            static function () use ($path): void {
+                readfile($path);
+            },
+            $file->original_name,
+            [
+                'Content-Type' => $file->mime_type ?: 'application/octet-stream',
+                'Cache-Control' => 'private, no-store',
+                'X-Content-Type-Options' => 'nosniff',
+            ],
+            'attachment'
+        );
+    }
+
+    public function sourceFilePageInfo(string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
+    {
+        $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
+        return $this->pageInfoResponse($file, $storage, $renderer);
+    }
+
+    public function sourceFilePage(string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
+    {
+        $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
+        return $this->pageResponse($file, $pageNumber, $storage, $renderer);
+    }
+
+    public function attemptFilePageInfo(string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
+    {
+        $file = DB::table('test_attempt_files as file')
+            ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
+            ->where('attempt.testId', $testId)
+            ->where('file.id', $fileId)
+            ->first(['file.*']);
+        return $this->pageInfoResponse($file, $storage, $renderer);
+    }
+
+    public function attemptFilePage(string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
+    {
+        $file = DB::table('test_attempt_files as file')
+            ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
+            ->where('attempt.testId', $testId)
+            ->where('file.id', $fileId)
+            ->first(['file.*']);
+        return $this->pageResponse($file, $pageNumber, $storage, $renderer);
+    }
+
+    public function studentAttemptFilePageInfo(Request $request, string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
+    {
+        $file = $this->studentAttemptFile($request, $testId, $fileId);
+        return $this->pageInfoResponse($file, $storage, $renderer);
+    }
+
+    public function studentAttemptFilePage(Request $request, string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
+    {
+        $file = $this->studentAttemptFile($request, $testId, $fileId);
+        return $this->pageResponse($file, $pageNumber, $storage, $renderer);
+    }
+
+    public function studentSourceFilePageInfo(Request $request, string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
+    {
+        $this->assertStudentResultReleased($request, $testId);
+        $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
+        return $this->pageInfoResponse($file, $storage, $renderer);
+    }
+
+    public function studentSourceFilePage(Request $request, string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
+    {
+        $this->assertStudentResultReleased($request, $testId);
+        $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
+        return $this->pageResponse($file, $pageNumber, $storage, $renderer);
     }
 
     public function index(): JsonResponse
@@ -170,6 +376,12 @@ class TestsController
         if (!$test || !$student) {
             return response()->json(['message' => 'Test or student not found.'], 404);
         }
+        if (!DB::table('subject_user_access')
+            ->where('subject_id', $test->subject_id)
+            ->where('user_id', $studentId)
+            ->exists()) {
+            throw new AccessDeniedHttpException('The student does not have access to this test subject.');
+        }
         $deadline = \Illuminate\Support\Carbon::parse($input['deadlineAt']);
         if (!$deadline->isFuture() ||
             ($test->deadline_at !== null && $deadline->lessThan(\Illuminate\Support\Carbon::parse($test->deadline_at)))) {
@@ -217,7 +429,8 @@ class TestsController
 
         return response()->json([
             'deficiencyReportPrompt' => $setting?->deficiency_report_prompt ?? '',
-            'resultReleaseDelayHours' => (int) ($setting?->result_release_delay_hours ?? 24),
+            'resultReleaseDelayHours' => (int) ($setting?->result_release_delay_hours ?? 0),
+            'notebookDailyQuestionLimit' => (int) ($setting?->notebook_daily_question_limit ?? 15),
         ]);
     }
 
@@ -226,16 +439,21 @@ class TestsController
         $input = $request->validate([
             'deficiencyReportPrompt' => ['nullable', 'string', 'max:4000'],
             'resultReleaseDelayHours' => ['required', 'integer', 'min:0', 'max:720'],
+            'notebookDailyQuestionLimit' => ['sometimes', 'required', 'integer', 'min:1', 'max:1000'],
         ]);
         $payload = [
             'deficiencyReportPrompt' => $input['deficiencyReportPrompt'] ?? '',
             'resultReleaseDelayHours' => (int) $input['resultReleaseDelayHours'],
+            'notebookDailyQuestionLimit' => (int) ($input['notebookDailyQuestionLimit']
+                ?? DB::table('ai_grading_settings')->where('id', 1)->value('notebook_daily_question_limit')
+                ?? 15),
         ];
         DB::table('ai_grading_settings')->updateOrInsert(
             ['id' => 1],
             [
                 'deficiency_report_prompt' => $payload['deficiencyReportPrompt'],
                 'result_release_delay_hours' => $payload['resultReleaseDelayHours'],
+                'notebook_daily_question_limit' => $payload['notebookDailyQuestionLimit'],
                 'updated_at' => now(),
             ]
         );
@@ -250,11 +468,8 @@ class TestsController
 
     public function retryAssessment(string $testId, string $attemptId): JsonResponse
     {
-        try {
-            return response()->json($this->assessment->gradeAttempt($testId, $attemptId));
-        } catch (\RuntimeException $error) {
-            return response()->json(['message' => $error->getMessage()], 503);
-        }
+        // Queue the submission; the background grading worker picks it up.
+        return response()->json($this->assessment->requeueAttempt($testId, $attemptId));
     }
 
     public function downloadAttemptFile(string $testId, string $fileId, PrivateFileStorage $storage): JsonResponse|StreamedResponse
@@ -308,6 +523,120 @@ class TestsController
         }
 
         return response()->json($this->assessment->updateMarks($testId, $studentId, $input));
+    }
+
+    private function sourceFilesForTest(string $testId): array
+    {
+        return DB::table('test_source_files')
+            ->where('test_id', $testId)
+            ->orderBy('created_at')
+            ->get(['id', 'original_name', 'mime_type', 'size_bytes', 'created_at'])
+            ->map(static fn (object $file): array => [
+                'id' => $file->id,
+                'originalName' => $file->original_name,
+                'mimeType' => $file->mime_type,
+                'sizeBytes' => (int) $file->size_bytes,
+                'createdAt' => $file->created_at,
+            ])->all();
+    }
+
+    private function pageInfoResponse(?object $file, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
+    {
+        if (!$file || !is_string($file->storage_key ?? null)) {
+            return response()->json(['message' => 'Page source file not found.'], 404);
+        }
+        try {
+            $path = $storage->resolve($file->storage_key);
+            if (!is_file($path)) {
+                return response()->json(['message' => 'Page source file is unavailable.'], 404);
+            }
+            $mimeType = (string) ($file->mime_type ?? 'application/octet-stream');
+            $pageCount = $mimeType === 'application/pdf'
+                ? $renderer->pageCount($path)
+                : (str_starts_with($mimeType, 'image/') ? 1 : 0);
+            if ($pageCount < 1) {
+                return response()->json(['message' => 'Only PDF and image files have renderable pages.'], 422);
+            }
+
+            return response()->json(['pageCount' => $pageCount]);
+        } catch (RuntimeException $error) {
+            return response()->json(['message' => $error->getMessage()], 503);
+        }
+    }
+
+    private function pageResponse(
+        ?object $file,
+        string $pageNumber,
+        PrivateFileStorage $storage,
+        DocumentPageRenderer $renderer
+    ): \Illuminate\Http\Response|JsonResponse {
+        if (!$file || !is_string($file->storage_key ?? null)) {
+            return response()->json(['message' => 'Page source file not found.'], 404);
+        }
+        if (!ctype_digit($pageNumber) || (int) $pageNumber < 1 || (int) $pageNumber > 30) {
+            return response()->json(['message' => 'Page number must be between 1 and 30.'], 422);
+        }
+        try {
+            $path = $storage->resolve($file->storage_key);
+            if (!is_file($path)) {
+                return response()->json(['message' => 'Page source file is unavailable.'], 404);
+            }
+            $page = $renderer->renderPage($path, (string) $file->mime_type, (int) $pageNumber);
+
+            return response($page['buffer'], 200, [
+                'Content-Type' => $page['mimeType'],
+                'Cache-Control' => 'private, no-store',
+                'X-Content-Type-Options' => 'nosniff',
+            ]);
+        } catch (RuntimeException $error) {
+            $status = str_contains(strtolower($error->getMessage()), 'does not exist') ||
+                str_contains(strtolower($error->getMessage()), 'contain one page')
+                ? 404
+                : 503;
+
+            return response()->json(['message' => $error->getMessage()], $status);
+        }
+    }
+
+    private function studentAttemptFile(Request $request, string $testId, string $fileId): ?object
+    {
+        $identity = (array) $request->attributes->get('apiIdentity');
+        $file = DB::table('test_attempt_files as file')
+            ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
+            ->join('tests as test', 'test.id', '=', 'attempt.testId')
+            ->where('attempt.testId', $testId)
+            ->where('attempt.studentId', $identity['userId'] ?? '')
+            ->where('file.id', $fileId)
+            ->first(['file.*', 'test.subject_id']);
+        if (!$file || !DB::table('subject_user_access')
+            ->where('user_id', $identity['userId'] ?? '')
+            ->where('subject_id', $file->subject_id)
+            ->exists()) {
+            return null;
+        }
+
+        return $file;
+    }
+
+    private function assertStudentResultReleased(Request $request, string $testId): void
+    {
+        $identity = (array) $request->attributes->get('apiIdentity');
+        $test = DB::table('tests')->where('id', $testId)->first();
+        if (!$test || ($identity['role'] ?? null) !== 'student' ||
+            !DB::table('subject_user_access')
+                ->where('user_id', $identity['userId'] ?? '')
+                ->where('subject_id', $test->subject_id)
+                ->exists()) {
+            throw new AccessDeniedHttpException('You do not have access to this test.');
+        }
+        $attempt = DB::table('test_attempts')
+            ->where('testId', $testId)
+            ->where('studentId', $identity['userId'])
+            ->first();
+        if (!$attempt || $attempt->status !== 'COMPLETED' || $attempt->marksObtained === null ||
+            ($attempt->result_available_at !== null && Carbon::parse($attempt->result_available_at)->isFuture())) {
+            throw new AccessDeniedHttpException('Source pages are available after results are released.');
+        }
     }
 
     private function validateBody(Request $request): array

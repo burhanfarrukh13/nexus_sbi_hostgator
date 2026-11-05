@@ -38,7 +38,7 @@ DEALLOCATE PREPARE add_prompt_language_stmt;
 SET @add_result_release_delay_sql = (
   SELECT IF(
     COUNT(*) = 0,
-    'ALTER TABLE `ai_grading_settings` ADD COLUMN `result_release_delay_hours` SMALLINT UNSIGNED NOT NULL DEFAULT 24 AFTER `deficiency_report_prompt`',
+    'ALTER TABLE `ai_grading_settings` ADD COLUMN `result_release_delay_hours` SMALLINT UNSIGNED NOT NULL DEFAULT 0 AFTER `deficiency_report_prompt`',
     'SELECT 1'
   )
   FROM information_schema.columns
@@ -54,4 +54,8 @@ DEALLOCATE PREPARE add_result_release_delay_stmt;
 INSERT IGNORE INTO `ai_grading_settings`
   (`id`, `deficiency_report_prompt`, `result_release_delay_hours`)
 VALUES
-  (1, 'Review the student work fairly, highlight the strongest points first, then identify the main gaps with clear, actionable guidance.', 24);
+  (1, 'Review the student work fairly, highlight the strongest points first, then identify the main gaps with clear, actionable guidance.', 0);
+
+UPDATE `ai_grading_settings`
+SET `result_release_delay_hours` = 0
+WHERE `id` = 1;

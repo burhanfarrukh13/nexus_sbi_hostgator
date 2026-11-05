@@ -27,7 +27,7 @@ The user-designated school/content/billing tables and their workflows are remove
 - **REQ-005 — Clean install:** Create schema only, with no imported user or business records. Create the initial admin separately after the final schema install.
 - **DEC-001 — Schema initialization:** Choose either `database.sql` import or Laravel migrations on a fresh database. Do not run `artisan migrate` after SQL import because the SQL intentionally omits Laravel migration bookkeeping.
 - **DEC-002 — Access model:** Student test and notebook access is restricted by `subject_user_access`; tests and notebook content use `subject_id`. No legacy folder or school-specific authorization is retained.
-- **DEC-003 — Test assessment:** Readable answer text is assessed synchronously with Ollama and validated against the authored marking criteria. Scores are stored immediately and hidden from students until the configurable result-release time (24 hours by default); image-only answers require manual review, and administrators can retry or edit marks.
+- **DEC-003 — Test assessment:** Submissions are saved immediately and graded by the background `ai-tests:grade-pending` worker (cPanel cron every 15 minutes) with Ollama, validated against the authored marking criteria. Scores are released to students immediately by default (`result_release_delay_hours` = 0) unless an administrator configures a 0-720 hour delay; administrators can retry or edit marks.
 - **DEC-004 — HostGator verification:** The supplied PHP/MySQL capability is user-provided; exact cPanel PHP version/extensions, MySQL version, outbound HTTPS, limits, and deployment paths remain unverified.
 
 ## Implementation and verification
@@ -71,7 +71,7 @@ The SQL file does not create/select a database and does not create a `migrations
 
 ## Known limitations
 
-- Automatic test grading and grading-worker recovery are unavailable; submission persistence is not proof of grading.
+- Grading depends on the cron-driven worker running every 15 minutes with working provider credentials; a saved submission is not proof it has been graded. Throughput on shared hosting is limited (see docs/HOSTGATOR-DEPLOYMENT.md, Capacity).
 - AI Notebook requires valid cloud embedding and chat API credentials, matching model dimensions, and outbound HTTPS.
 - Actual HostGator runtime and service limits have not been tested.
 - SQL import is destructive to the declared application tables; preserve data with a backup and use a fresh database for clean installation.

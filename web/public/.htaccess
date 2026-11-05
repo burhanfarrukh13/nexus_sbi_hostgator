@@ -1,9 +1,52 @@
+# Static SPA for HostGator. Vite copies this file into dist/.
 Options -Indexes
+
+# Older Apache builds serve .mjs as application/octet-stream. Combined with
+# X-Content-Type-Options: nosniff that blocks the PDF.js worker, which the
+# PDF-to-photo conversion depends on. After deploying, check:
+#   curl -sI https://YOUR-SITE/assets/<pdf.worker file>.mjs   (Content-Type: text/javascript)
+<IfModule mod_mime.c>
+    AddType text/javascript .mjs
+</IfModule>
 
 <IfModule mod_rewrite.c>
     RewriteEngine On
+
+    # Send plain HTTP to HTTPS (also honours a proxy/CDN that terminates TLS).
+    RewriteCond %{HTTPS} !=on
+    RewriteCond %{HTTP:X-Forwarded-Proto} !=https [NC]
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # Vite fingerprints everything under /assets, so it can be cached for a year (see below).
+    RewriteRule ^assets/ - [E=NEXUS_IMMUTABLE:1]
+
     RewriteCond %{REQUEST_FILENAME} -f [OR]
     RewriteCond %{REQUEST_FILENAME} -d
     RewriteRule ^ - [L]
+
+    # A missing asset must be a 404, not the SPA shell (a stale index.html would otherwise
+    # load HTML as JavaScript and the 404 keeps it out of the one-year cache).
+    RewriteRule ^assets/ - [R=404,L]
+
     RewriteRule ^ index.html [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    Header always set Strict-Transport-Security "max-age=31536000"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "geolocation=(), microphone=(), payment=()"
+
+    # connect-src allows any HTTPS API origin so the site works wherever the API lives.
+    # scripts/prepare-hostgator-package narrows it to the exact API origin it builds against.
+    # Google Fonts is loaded by styles.css; blob:/data: cover generated page images and downloads;
+    # wasm-unsafe-eval lets PDF.js use WebAssembly (it does not allow JavaScript eval).
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' https:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
+    # The shell must always be revalidated so a new deploy is picked up; fingerprinted assets never change.
+    <FilesMatch "\.html$">
+        Header set Cache-Control "no-cache"
+    </FilesMatch>
+    Header set Cache-Control "public, max-age=31536000, immutable" env=NEXUS_IMMUTABLE
 </IfModule>

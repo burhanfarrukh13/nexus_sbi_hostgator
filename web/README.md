@@ -40,6 +40,6 @@ Deploy `dist` as static files; HostGator does not need a Node.js process.
 - **Students:** view available tests, submit answers, review released results, request access after an expired deadline, and use AI Notebook.
 - **Administrators:** manage standalone subjects, notebook sources/prompts, tests, access requests, team members, and user accounts according to permissions.
 - Notebook sources are stored privately and indexed through OpenRouter embeddings. Chat uses the configured Ollama Cloud model; students can set a personal prompt and response language per subject.
-- Typed/selectable-text test answers are graded synchronously through Ollama. Photos and PDF pages are submitted as images and queued for the cPanel grading cron; marks are stored when grading finishes and hidden until the configured result release delay passes (24 hours by default). The Ollama model must support vision. Admins can retry provider failures and edit marks.
+- Submissions are saved immediately and graded by the cPanel grading cron (every 15 minutes); no completion-time estimate is shown until staging measurements are available. Typed answers are queued too unless `GRADING_QUEUE_TYPED=false`. Photos and PDF pages are submitted as images. Marks are stored when grading finishes and released immediately by default; administrators can configure a 0-720 hour release delay. The Ollama model must support vision. Admins can retry non-provider failures and edit marks.
 
 Run `npm run typecheck` and `npm run build` before packaging.

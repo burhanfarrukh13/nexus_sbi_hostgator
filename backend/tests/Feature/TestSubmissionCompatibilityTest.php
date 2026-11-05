@@ -46,7 +46,52 @@ class TestSubmissionCompatibilityTest extends TestCase
         );
     }
 
-    public function test_image_only_complete_paper_is_saved_for_manual_review_with_clear_guidance(): void
+    public function test_server_draft_restores_and_submission_retries_are_idempotent(): void
+    {
+        $student = $this->createUser('draft-recovery@example.test', 'student');
+        [$subjectId, $testId] = $this->createTest();
+        $this->grantSubject($student, $subjectId);
+        $token = $this->token($student);
+        $draftAnswers = json_encode([
+            ['questionNumber' => 1, 'answerText' => 'Draft answer'],
+        ], JSON_THROW_ON_ERROR);
+
+        $this->withToken($token)->putJson("/api/tests/{$testId}/me/draft", [
+            'answers' => $draftAnswers,
+        ])->assertOk()->assertJsonPath('saved', true);
+        $this->withToken($token)->getJson("/api/tests/{$testId}/me")
+            ->assertOk()
+            ->assertJsonPath('draftAnswers.0.answerText', 'Draft answer');
+
+        $submissionId = (string) Str::uuid();
+        $submitted = json_encode([
+            ['questionNumber' => 1, 'answerText' => 'Final answer'],
+        ], JSON_THROW_ON_ERROR);
+        $first = $this->withToken($token)->postJson("/api/tests/{$testId}/me/submit", [
+            'answers' => $submitted,
+            'clientSubmissionId' => $submissionId,
+        ])->assertCreated()->assertJsonPath('status', 'SUBMITTED');
+
+        $retry = $this->withToken($token)->postJson("/api/tests/{$testId}/me/submit", [
+            'answers' => json_encode([
+                ['questionNumber' => 1, 'answerText' => 'Different retry payload'],
+            ], JSON_THROW_ON_ERROR),
+            'clientSubmissionId' => $submissionId,
+        ])->assertCreated()
+            ->assertJsonPath('attemptId', $first->json('attemptId'))
+            ->assertJsonPath('status', 'SUBMITTED');
+
+        self::assertSame(1, DB::table('test_attempts')->where('testId', $testId)->count());
+        $attempt = DB::table('test_attempts')->where('id', $first->json('attemptId'))->first();
+        self::assertSame($submissionId, $attempt->client_submission_id);
+        self::assertNull($attempt->draft_answers);
+        self::assertSame('Final answer', json_decode($attempt->submitted_answers, true)[0]['answerText']);
+        $this->withToken($token)->putJson("/api/tests/{$testId}/me/draft", [
+            'answers' => $draftAnswers,
+        ])->assertOk()->assertJsonPath('saved', false);
+    }
+
+    public function test_pdf_complete_paper_is_queued_for_server_side_ingestion(): void
     {
         $student = $this->createUser('scanned-paper@example.test', 'student');
         [$subjectId, $testId] = $this->createTest();
@@ -58,14 +103,12 @@ class TestSubmissionCompatibilityTest extends TestCase
             ])
             ->assertCreated()
             ->assertJsonPath('gradingPending', true)
-            ->assertJsonPath(
-                'gradingMessage',
-                'Your submission was saved, but AI could not read answers from the uploaded file. Upload clearer page images or type answers in the answer boxes; an administrator can also grade it manually.'
-            );
+            ->assertJsonPath('gradingQueued', true)
+            ->assertJsonPath('status', 'SUBMITTED');
 
         $attempt = DB::table('test_attempts')->where('testId', $testId)->where('studentId', $student)->first();
         self::assertSame('SUBMITTED', $attempt->status);
-        self::assertStringContainsString('manual review', $attempt->grading_error);
+        self::assertNull($attempt->grading_error);
     }
 
     public function test_image_answers_are_queued_and_processed_by_the_grading_command(): void
@@ -119,7 +162,8 @@ class TestSubmissionCompatibilityTest extends TestCase
             ->getJson("/api/tests/{$testId}/me")
             ->assertOk()
             ->assertJsonPath('attempt.gradingComplete', true)
-            ->assertJsonPath('attempt.marksObtained', null);
+            ->assertJsonPath('attempt.isResultReleased', true)
+            ->assertJsonPath('attempt.marksObtained', 2);
         Http::assertSent(fn ($request): bool =>
             is_array($request['messages'][1]['content'] ?? null) &&
             collect($request['messages'][1]['content'])->contains(
@@ -129,8 +173,10 @@ class TestSubmissionCompatibilityTest extends TestCase
         );
     }
 
-    public function test_ai_marks_are_stored_immediately_and_hidden_until_the_release_time(): void
+    public function test_ai_marks_are_released_immediately_by_default(): void
     {
+        // Grade during the request (the production default queues typed answers).
+        config(['services.grading.queue_typed' => false]);
         $student = $this->createUser('graded-student@example.test', 'student');
         [$subjectId, $testId] = $this->createTest();
         $this->grantSubject($student, $subjectId);
@@ -164,34 +210,29 @@ class TestSubmissionCompatibilityTest extends TestCase
         self::assertSame('COMPLETED', $attempt->status);
         self::assertEquals(2, (float) $attempt->marksObtained);
         self::assertNotNull($attempt->ai_assessment);
-        self::assertTrue(now()->addHours(23)->lessThan(\Illuminate\Support\Carbon::parse($attempt->result_available_at)));
+        self::assertLessThanOrEqual(
+            now()->addSeconds(5)->timestamp,
+            \Illuminate\Support\Carbon::parse($attempt->result_available_at)->timestamp
+        );
 
         $token = $this->token($student);
         $this->withToken($token)
             ->getJson('/api/tests/me/attempts')
             ->assertOk()
-            ->assertJsonPath('0.attempt.status', 'SUBMITTED')
-            ->assertJsonPath('0.attempt.marksObtained', null)
-            ->assertJsonPath('0.attempt.isResultReleased', false);
+            ->assertJsonPath('0.attempt.status', 'COMPLETED')
+            ->assertJsonPath('0.attempt.marksObtained', 2)
+            ->assertJsonPath('0.attempt.isResultReleased', true);
         $this->withToken($token)
-            ->getJson("/api/tests/{$testId}/me")
-            ->assertOk()
-            ->assertJsonPath('attempt.marksObtained', null)
-            ->assertJsonPath('attempt.aiAssessment', null);
-
-        DB::table('test_attempts')->where('id', $attempt->id)->update([
-            'result_available_at' => now()->subMinute(),
-        ]);
-        $resultResponse = $this->withToken($token)
             ->getJson("/api/tests/{$testId}/me")
             ->assertOk()
             ->assertJsonPath('attempt.isResultReleased', true)
             ->assertJsonPath('attempt.aiAssessment.deficiencyReport', 'Good work.');
-        self::assertEquals(2, (float) $resultResponse->json('attempt.marksObtained'));
     }
 
     public function test_admin_can_change_marks_and_set_the_result_release_delay(): void
     {
+        // Grade during the request (the production default queues typed answers).
+        config(['services.grading.queue_typed' => false]);
         $student = $this->createUser('editable-student@example.test', 'student');
         $admin = $this->createUser('grading-admin@example.test', 'admin');
         DB::table('user_role_assignments')->insert([
@@ -251,6 +292,8 @@ class TestSubmissionCompatibilityTest extends TestCase
 
     public function test_invalid_model_marks_are_not_persisted(): void
     {
+        // Grade during the request (the production default queues typed answers).
+        config(['services.grading.queue_typed' => false]);
         $student = $this->createUser('invalid-grade-student@example.test', 'student');
         $admin = $this->createUser('retry-grading-admin@example.test', 'admin');
         DB::table('user_role_assignments')->insert([
@@ -269,6 +312,19 @@ class TestSubmissionCompatibilityTest extends TestCase
         Http::fakeSequence('ollama.example.test/*')
             ->push(['choices' => [['message' => ['content' => json_encode([
                 'deficiencyReport' => 'Invalid.',
+                'questions' => [[
+                    'questionNumber' => 1,
+                    'deficiencyReport' => 'Invalid.',
+                    'criteria' => [[
+                        'criterionIndex' => 0,
+                        'marksAwarded' => 3,
+                        'feedback' => 'Invalid score.',
+                        'evidence' => ['4'],
+                    ]],
+                ]],
+            ], JSON_THROW_ON_ERROR)]]]], 200)
+            ->push(['choices' => [['message' => ['content' => json_encode([
+                'deficiencyReport' => 'Invalid again.',
                 'questions' => [[
                     'questionNumber' => 1,
                     'deficiencyReport' => 'Invalid.',
@@ -303,18 +359,46 @@ class TestSubmissionCompatibilityTest extends TestCase
             ->assertCreated()
             ->assertJsonPath('status', 'SUBMITTED')
             ->assertJsonPath('gradingPending', true)
-            ->assertJsonPath('gradingMessage', 'Your answers were saved, but automated grading could not complete. An administrator can review and retry it.');
+            ->assertJsonPath('gradingQueued', false)
+            ->assertJsonPath('gradingMessage', 'Your answers are saved. A teacher will check them.')
+            ->assertJsonMissingPath('gradingError');
 
         $attempt = DB::table('test_attempts')->where('testId', $testId)->where('studentId', $student)->first();
         self::assertNull($attempt->marksObtained);
         self::assertNull($attempt->ai_assessment);
-        self::assertStringContainsString('outside the permitted rubric', $attempt->grading_error);
+        // Students only ever see a generic failure reason, never the model's raw output.
+        self::assertStringContainsString('can be retried', (string) $attempt->grading_error);
+        self::assertStringNotContainsString('rubric', (string) $attempt->grading_error);
+        $this->withToken($this->token($student))
+            ->getJson("/api/tests/{$testId}/me")
+            ->assertOk()
+            ->assertJsonPath('attempt.status', 'SUBMITTED')
+            ->assertJsonPath('attempt.gradingError', null);
+        // A student resubmit only puts the paper back in the queue; it never grades in the request.
+        $this->withToken($this->token($student))
+            ->postJson("/api/tests/{$testId}/me/attempts/{$attempt->id}/resubmit")
+            ->assertOk()
+            ->assertJsonPath('status', 'SUBMITTED')
+            ->assertJsonPath('gradingQueued', true);
+        $this->assertDatabaseHas('test_attempts', [
+            'id' => $attempt->id,
+            'status' => 'SUBMITTED',
+        ]);
 
+        // The admin retry button also queues the paper; the grading command then finishes it.
         $this->withToken($this->token($admin))
             ->postJson("/api/tests/{$testId}/attempts/{$attempt->id}/retry")
             ->assertOk()
-            ->assertJsonPath('status', 'COMPLETED')
-            ->assertJsonPath('marksObtained', 2);
+            ->assertJsonPath('status', 'SUBMITTED')
+            ->assertJsonPath('gradingQueued', true);
+        // A bad marking result is a teacher-attention problem, not an outage retry.
+        $this->artisan('ai-tests:grade-pending')->assertExitCode(1);
+        self::assertSame('FAILED', DB::table('test_attempts')->where('id', $attempt->id)->value('status'));
+        $this->withToken($this->token($admin))
+            ->postJson("/api/tests/{$testId}/attempts/{$attempt->id}/retry")
+            ->assertOk()
+            ->assertJsonPath('status', 'SUBMITTED');
+        $this->artisan('ai-tests:grade-pending')->assertExitCode(0);
 
         $this->assertDatabaseHas('test_attempts', [
             'id' => $attempt->id,

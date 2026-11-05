@@ -8,12 +8,12 @@ use Throwable;
 
 class CloudChatClient
 {
-    public function complete(array $messages, bool $jsonResponse = false): string
+    public function complete(array $messages, bool $jsonResponse = false, ?int $timeoutOverride = null): string
     {
         $url = (string) config('services.ai_chat.url');
         $key = (string) config('services.ai_chat.key');
         $model = (string) config('services.ai_chat.model');
-        $timeout = min(90, max(3, (int) config('services.ai_chat.timeout', 45)));
+        $timeout = min(300, max(3, $timeoutOverride ?? (int) config('services.ai_chat.timeout', 300)));
         if (!str_starts_with($url, 'https://') || $key === '' || $model === '') {
             throw new RuntimeException('Ollama Cloud is not configured. Set OLLAMA_API_URL, OLLAMA_API_KEY, and OLLAMA_MODEL.');
         }
@@ -30,15 +30,33 @@ class CloudChatClient
             $payload['response_format'] = ['type' => 'json_object'];
         }
 
-        try {
-            $response = Http::acceptJson()
-                ->withToken($key)
-                ->timeout($timeout)
-                ->post($url, $payload);
-        } catch (Throwable) {
-            throw new RuntimeException('Ollama chat provider is unavailable.');
+        $response = null;
+        $retryDelays = array_values((array) config('services.ai_chat.retry_delays', [1, 3, 8]));
+        $maxAttempts = count($retryDelays) + 1;
+        for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
+            try {
+                $response = Http::acceptJson()
+                    ->withToken($key)
+                    ->timeout($timeout)
+                    ->post($url, $payload);
+            } catch (Throwable) {
+                if ($attempt < $maxAttempts - 1) {
+                    $this->waitBeforeRetry($attempt, $retryDelays);
+                    continue;
+                }
+                throw new RuntimeException('Ollama chat provider is unavailable.');
+            }
+            if ($response->successful() ||
+                ($response->status() < 500 && $response->status() !== 429) ||
+                $attempt >= $maxAttempts - 1) {
+                break;
+            }
+            $this->waitBeforeRetry($attempt, $retryDelays, $response->header('Retry-After'));
         }
 
+        if ($response === null) {
+            throw new RuntimeException('Ollama chat provider is unavailable.');
+        }
         if (!$response->successful()) {
             throw new RuntimeException('Ollama chat provider rejected the request.');
         }
@@ -57,6 +75,35 @@ class CloudChatClient
         }
 
         return trim($content);
+    }
+
+    /**
+     * Retry-After takes precedence over local exponential backoff. Otherwise
+     * jitter spreads simultaneous retries without changing the model request.
+     *
+     * @param list<int|float> $delays
+     */
+    private function waitBeforeRetry(int $attempt, array $delays, ?string $retryAfter = null): void
+    {
+        $seconds = null;
+        if ($retryAfter !== null && trim($retryAfter) !== '') {
+            $retryAfter = trim($retryAfter);
+            if (is_numeric($retryAfter)) {
+                $seconds = max(0.0, (float) $retryAfter);
+            } else {
+                $timestamp = strtotime($retryAfter);
+                if ($timestamp !== false) {
+                    $seconds = max(0.0, (float) ($timestamp - time()));
+                }
+            }
+        }
+        if ($seconds === null) {
+            $base = max(0.0, (float) ($delays[$attempt] ?? 8));
+            $seconds = $base * (1 + (random_int(0, 20) / 100));
+        }
+        if ($seconds > 0) {
+            usleep((int) min($seconds * 1_000_000, 300_000_000));
+        }
     }
 
     private function containsImages(array $messages): bool

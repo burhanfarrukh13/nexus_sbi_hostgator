@@ -134,8 +134,53 @@ class TestStudentAccessService
             'questions' => $studentQuestions,
             'lectures' => [],
             'attempt' => $this->studentAttemptView($attempt, $questions, $attemptFiles),
+            'draftAnswers' => $this->decodeJson($attempt->draft_answers ?? null, []),
             'solutionSourceFiles' => $solutionSourceFiles,
             'effectiveDeadlineAt' => $this->isoDate($attempt->deadline_override_at ?? $test->deadline_at ?? null),
+        ];
+    }
+
+    /**
+     * Return only the student's grading state; never expose queue depth or
+     * internal provider errors on this endpoint.
+     *
+     * @return array{status: string, gradingComplete: bool, gradingError: bool, retryAfterSeconds: int}
+     */
+    public function getStatusForStudent(string $testId, string $studentId): array
+    {
+        $this->requireStudentTestAccess($testId, $studentId);
+        $attempt = DB::table('test_attempts')
+            ->where('testId', $testId)
+            ->where('studentId', $studentId)
+            ->first(['status', 'marksObtained', 'grading_error', 'updatedAt']);
+
+        if ($attempt === null) {
+            return [
+                'status' => 'NOT_ATTEMPTED',
+                'gradingComplete' => false,
+                'gradingError' => false,
+                'retryAfterSeconds' => 60,
+            ];
+        }
+
+        $complete = $attempt->marksObtained !== null || $attempt->status === 'COMPLETED';
+        $status = $complete ? 'COMPLETED' : (
+            in_array($attempt->status, ['IN_PROGRESS', 'REQUESTED'], true)
+                ? $attempt->status
+                : 'SUBMITTED'
+        );
+        $retryAfter = 60;
+        if (!$complete && $attempt->status !== 'NOT_ATTEMPTED') {
+            $queued = (int) DB::table('test_attempts')->where('status', 'SUBMITTED')->count();
+            $workers = max(1, (int) config('services.grading.workers', 2));
+            $retryAfter = min(60, max(20, (int) ceil(($queued / $workers) * 20)));
+        }
+
+        return [
+            'status' => $status,
+            'gradingComplete' => $complete,
+            'gradingError' => $attempt->grading_error !== null && $attempt->grading_error !== '',
+            'retryAfterSeconds' => $retryAfter,
         ];
     }
 
@@ -196,6 +241,46 @@ class TestStudentAccessService
         });
     }
 
+    public function submitReview(string $testId, string $studentId, string $note): array
+    {
+        $this->requireStudentTestAccess($testId, $studentId);
+        $note = trim($note);
+        if (mb_strlen($note) < 1 || mb_strlen($note) > 4000) {
+            throw new BadRequestHttpException('A review note must contain between 1 and 4000 characters.');
+        }
+
+        return DB::transaction(function () use ($testId, $studentId, $note): array {
+            $attempt = DB::table('test_attempts')
+                ->where('testId', $testId)
+                ->where('studentId', $studentId)
+                ->lockForUpdate()
+                ->first();
+            if (!$attempt || $attempt->status !== 'COMPLETED' || $attempt->submitted_at === null ||
+                $attempt->marksObtained === null) {
+                throw new BadRequestHttpException('A completed, graded attempt is required to request a mark review.');
+            }
+            if ($attempt->result_available_at !== null && Carbon::parse($attempt->result_available_at)->isFuture()) {
+                throw new BadRequestHttpException('A mark review can be requested after the result is released.');
+            }
+            $submittedAt = now();
+            DB::table('test_attempts')->where('id', $attempt->id)->update([
+                'review_note' => $note,
+                'review_submitted_at' => $submittedAt,
+                'review_resolution' => null,
+                'review_resolved_at' => null,
+                'updatedAt' => $submittedAt,
+            ]);
+
+            return [
+                'ok' => true,
+                'testId' => $testId,
+                'attemptId' => $attempt->id,
+                'reviewNote' => $note,
+                'reviewSubmittedAt' => $submittedAt->utc()->toISOString(),
+            ];
+        });
+    }
+
     private function requireStudentTestAccess(string $testId, string $studentId): object
     {
         if (!Str::isUuid($testId)) {
@@ -227,7 +312,10 @@ class TestStudentAccessService
         }
         $marksObtained = $attempt->marksObtained;
         $released = $this->resultIsReleased($attempt);
-        $underMarking = $attempt->submitted_at !== null && !$released;
+        $underMarking = $attempt->status === 'COMPLETED' && !$released;
+        $studentStatus = $underMarking || $attempt->status === 'FAILED'
+            ? 'SUBMITTED'
+            : $attempt->status;
         $assessment = $this->decodeJson($attempt->ai_assessment, []);
         if ($released && isset($assessment['questions']) && is_array($assessment['questions'])) {
             $assessment['questions'] = array_map(static function (array $result) use ($questions): array {
@@ -246,7 +334,7 @@ class TestStudentAccessService
 
         return [
             'id' => $attempt->id,
-            'status' => $underMarking ? 'SUBMITTED' : $attempt->status,
+            'status' => $studentStatus,
             'appeared' => (bool) $attempt->appeared,
             'submittedAt' => $this->isoDate($attempt->submitted_at),
             'isResultReleased' => $released,
@@ -260,9 +348,7 @@ class TestStudentAccessService
             'marksObtained' => $released ? $marksObtained : null,
             'deficiencyNotes' => $released ? $attempt->deficiencyNotes : null,
             'aiAssessment' => $released && $assessment !== [] ? $assessment : null,
-            'gradingError' => $attempt->grading_error
-                ? 'The result could not be prepared. Please contact your administrator.'
-                : null,
+            'gradingError' => null,
             'reviewResolution' => $attempt->review_resolution,
             'reviewResolvedAt' => $this->isoDate($attempt->review_resolved_at),
         ];

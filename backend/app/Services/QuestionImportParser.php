@@ -264,6 +264,7 @@ class QuestionImportParser
             !preg_match('/\bpage\s+\d+\s+of\s+\d+\s*$/i', $line) &&
             !preg_match('/^--\s*\d+(?:\s+of\s+\d+)?\s*--$/i', $line)
         ));
+        $lines = $this->joinWrappedCriteria($lines);
         if ($lines === []) {
             return [];
         }
@@ -291,5 +292,33 @@ class QuestionImportParser
             }
         }
         return $result;
+    }
+
+    private function joinWrappedCriteria(array $lines): array
+    {
+        $normalized = [];
+        for ($index = 0; $index < count($lines); $index++) {
+            $line = $lines[$index];
+            if (preg_match('/(?:\||\t)\s*$/', $line) === 1 &&
+                isset($lines[$index + 1]) &&
+                preg_match('/^\d+(?:\.\d+)?$/', $lines[$index + 1]) === 1) {
+                $line .= ' '.$lines[++$index];
+            }
+            $normalized[] = $line;
+        }
+
+        $joined = [];
+        foreach ($normalized as $line) {
+            if (preg_match(self::ALLOC, $line) === 1 &&
+                $joined !== [] &&
+                preg_match(self::ALLOC, $joined[count($joined) - 1]) !== 1 &&
+                preg_match('/^(?:\(?[a-z]\)|\d+[.)])\s+/i', $line) !== 1) {
+                $joined[count($joined) - 1] .= ' '.$line;
+            } else {
+                $joined[] = $line;
+            }
+        }
+
+        return $joined;
     }
 }

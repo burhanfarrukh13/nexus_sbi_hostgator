@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 
 class TopPerformersController
@@ -23,6 +24,10 @@ class TopPerformersController
             return response()->json([]);
         }
 
+        $subjectIds = $subjectIds->sort()->values();
+        $cacheKey = 'leaderboard:v1:'.hash('sha256', $subjectIds->implode('|').':'.$studentId);
+
+        return response()->json(Cache::remember($cacheKey, now()->addSeconds(60), function () use ($studentId, $subjectIds): array {
         $performances = DB::table('test_attempts as attempt')
             ->join('tests as test', 'test.id', '=', 'attempt.testId')
             ->join('subject_user_access as access', function ($join): void {
@@ -72,7 +77,7 @@ class TopPerformersController
             $topTen->push($currentUser);
         }
 
-        return response()->json($topTen->values()->map(static fn (array $row): array => [
+        return $topTen->values()->map(static fn (array $row): array => [
             'rank' => $row['rank'],
             'displayIdentifier' => $row['studentId'] === $studentId ? 'You' : 'Learner '.$row['rank'],
             'isCurrentUser' => $row['studentId'] === $studentId,
@@ -80,6 +85,7 @@ class TopPerformersController
             'totalMarks' => $row['totalMarks'],
             'maxMarks' => $row['maxMarks'],
             'percentage' => $row['percentage'],
-        ])->all());
+        ])->all();
+        }));
     }
 }

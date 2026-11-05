@@ -71,6 +71,39 @@ class OllamaChatClientTest extends TestCase
         );
     }
 
+    public function test_it_retries_rate_limited_provider_calls_and_honors_retry_after(): void
+    {
+        Config::set('services.ai_chat.retry_delays', [0]);
+        Http::fake([
+            'ollama.example.test/*' => Http::sequence()
+                ->push(['error' => 'busy'], 429, ['Retry-After' => '0'])
+                ->push(['choices' => [['message' => ['content' => 'Recovered answer.']]]]),
+        ]);
+
+        self::assertSame('Recovered answer.', app(CloudChatClient::class)->complete([
+            ['role' => 'user', 'content' => 'Try again safely.'],
+        ]));
+
+        Http::assertSentCount(2);
+    }
+
+    public function test_notebook_timeout_override_is_accepted_without_changing_the_chat_contract(): void
+    {
+        Config::set('services.ai_chat.timeout', 300);
+        Config::set('services.ai_chat.retry_delays', []);
+        Http::fake([
+            'ollama.example.test/*' => Http::response([
+                'choices' => [['message' => ['content' => 'Short-timeout answer.']]],
+            ]),
+        ]);
+
+        app(CloudChatClient::class)->complete([
+            ['role' => 'user', 'content' => 'Notebook question.'],
+        ], false, 60);
+
+        Http::assertSentCount(1);
+    }
+
     public function test_it_sends_image_content_to_a_vision_capable_model(): void
     {
         Config::set('services.ai_chat.model', 'gemma4:31b');

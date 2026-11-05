@@ -56,9 +56,13 @@ Subjects are standalone records used to group tests and notebook content; they d
 | `GET /api/ai-notebook/sessions?subjectId=...` | List the caller's conversations, optionally filtered by subject. |
 | `GET /api/ai-notebook/sessions/{id}` | Load one caller-owned conversation. |
 | `DELETE /api/ai-notebook/sessions/{id}` | Delete one caller-owned conversation. |
-| `POST /api/ai-notebook/chat` | Ask a subject-scoped question; request includes `subjectId`, `question`, and optional `sessionId`/`studyAidMode`. |
+| `POST /api/ai-notebook/chat` | Ask a subject-scoped question; first request includes `clientRequestId`, `subjectId`, `question` or `image`, and optional `sessionId`/`studyAidMode`. |
 
-Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollama Cloud model. Students can change their response language and personal prompt without changing the subject default. Configure `OPENROUTER_API_KEY`, `OPENROUTER_EMBEDDINGS_MODEL`, and `OPENROUTER_EMBEDDINGS_DIMENSIONS`, plus `OLLAMA_API_KEY` and `OLLAMA_MODEL`, in the backend environment. The supported starting configuration is `openai/text-embedding-3-small` with 1536 dimensions and Ollama's OpenAI-compatible `/v1/chat/completions` endpoint. Keys must not be added to the React build. If provider requests fail, the API returns a failure rather than a fabricated answer. Sources created before embeddings were configured can be upgraded with `php artisan ai-notebook:reindex-embeddings`.
+Notebook questions are limited to 15 successful answers per student per day by default. The admin may change the limit (1–1,000) in Tests & Marks > Settings. Failed answers are refunded; the date rolls over at midnight `Asia/Karachi` by default (backend `AI_NOTEBOOK_DAY_RESET_TIMEZONE`). A limit response is friendly and contains no queue position or ordinal. Provider credentials stay in backend environment variables and are never included in the settings API.
+
+Notebook chat runs at most eight provider requests at once by default (`NOTEBOOK_MAX_CONCURRENT`). If all slots are occupied, the request is stored as a private, owner-scoped FIFO ticket and returns `202` with only `retryAfterSeconds`; the browser retries the same `clientRequestId` without clearing the question. Pending tickets expire after two minutes without an owner recheck. Completed retries return the stored response, while provider failures keep the ticket and refund the daily reservation. Queued photos are stored outside the web root with private file permissions.
+
+Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollama Cloud model. Students can change their response language and personal prompt without changing the subject default. Configure `OPENROUTER_API_KEY`, `OPENROUTER_EMBEDDINGS_MODEL`, and `OPENROUTER_EMBEDDINGS_DIMENSIONS`, plus `OLLAMA_API_KEY` and `OLLAMA_MODEL`, in the backend environment. The supported starting configuration is `openai/text-embedding-3-small` with 1536 dimensions and Ollama's OpenAI-compatible `/v1/chat/completions` endpoint. Keys must not be added to the React build. If a chat provider request fails, its ticket is retained for retry rather than returning a fabricated answer. Sources created before embeddings were configured can be upgraded with `php artisan ai-notebook:reindex-embeddings`.
 
 ## Analytics
 
@@ -74,20 +78,28 @@ Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollam
 | `GET /api/tests` | List tests; teacher assistant/admin. |
 | `POST /api/tests` | Create a test using `subjectId`, title, deadline, total marks, and question/marking data; teacher assistant/admin. |
 | `POST /api/tests/questions/preview` | Parse uploaded question source files for authoring review. |
+| `POST /api/tests/{testId}/source-files` | Retain uploaded source PDFs/DOCX in private storage after test creation; teacher assistant/admin. |
+| `GET /api/tests/{testId}/source-files/{fileId}` | Download an original test source file; teacher assistant, testing manager, or admin. |
+| `GET /api/tests/{testId}/source-files/{fileId}/pages[/{pageNumber}]` | Read source page count or render a PDF/image page; teacher assistant, testing manager, or admin. |
 | `GET /api/tests/me/attempts` | List the authenticated student's tests and attempt state. |
 | `GET /api/tests/{id}/me` | Load a test with student-safe question fields. |
 | `POST /api/tests/{id}/me/request-access` | Request a deadline extension after expiry. |
 | `POST /api/tests/{id}/me/submit` | Store submitted answers/files, then assess readable text answers with the configured Ollama model. |
 | `POST /api/tests/{id}/me/attempts/{attemptId}/resubmit` | Retry assessment of a saved failed attempt. |
+| `POST /api/tests/{id}/me/review` | Submit a 1–4000 character review request for a completed result. |
+| `GET /api/tests/{id}/me/attempt-files/{fileId}/pages[/{pageNumber}]` | Read/render the student's own submission pages. |
+| `GET /api/tests/{id}/me/source-files/{fileId}/pages[/{pageNumber}]` | Read/render source pages after the result is released. |
 | `GET /api/tests/access-requests` | List pending requests; testing manager/admin. |
 | `PUT /api/tests/{testId}/deadline/{studentId}` | Grant a later deadline for a pending request; testing manager/admin. |
 | `GET /api/tests/{testId}/attempts` | List attempts, submitted answers, AI feedback, and review state; teacher assistant, testing manager, or admin. |
 | `POST /api/tests/{testId}/attempts/{attemptId}/retry` | Retry an assessment or inspect a previously ungraded attempt; testing manager/admin. |
 | `GET /api/tests/{testId}/attempts/files/{fileId}` | Download a private student answer file for manual review; teacher assistant, testing manager, or admin. |
+| `GET /api/tests/{testId}/attempts/files/{fileId}/pages[/{pageNumber}]` | Read/render submitted PDF or image pages; teacher assistant, testing manager, or admin. |
 | `PUT /api/tests/{testId}/marks/{studentId}` | Edit marks or resolve a student review request; teacher assistant, testing manager, or admin. |
-| `GET/PUT /api/tests/ai-grading-settings` | Read/update the AI feedback prompt and student result-release delay (0–720 hours); testing manager/admin. |
+| `GET/PUT /api/tests/ai-grading-settings` | Read/update the Notebook daily question limit, AI feedback prompt, and result-release delay (0–720 hours); admin permission only. |
+| `GET /api/tests/grading-queue`, `POST /api/tests/grading-queue/retry` | Read queue operational details or retry blocked submissions; admin permission only. |
 
-Tests and attempts reference `users` directly. Tests are grouped by `subjects`; no folder permissions or school-roster tables are used. Text answers are assessed synchronously with Ollama and marks/feedback are stored immediately. Students see a submitted/under-marking state until `result_available_at`; the delay defaults to 24 hours and administrators can change it, with 0 releasing results immediately. Image-only or otherwise unreadable answers remain available for manual review. Provider failures are recorded for administrator retry, and administrators can edit marks.
+Tests and attempts reference `users` directly. Tests are grouped by `subjects`; no folder permissions or school-roster tables are used. Results are immediately visible by default to match the original workflow; administrators may intentionally configure a 0–720 hour release delay. A grading failure moves the saved attempt to `FAILED` so the student can resubmit or an administrator can retry. The `ai-tests:grade-pending` command (cPanel cron every 15 minutes) grades queued submissions and first returns `PROCESSING` attempts stuck longer than `GRADING_STALE_MINUTES` (45 by default) to the queue; attempts still waiting in `SUBMITTED` are never failed. PDFs are text-extracted and rendered server-side when Imagick or `pdftoppm` is available; browser conversion remains an optimization. Source and answer page endpoints return `{pageCount}` and `image/*` page bytes. Review resolution requires a prior student review request.
 
 `test_attempts` intentionally remains the one-row-per-student/test lifecycle record. Its status, submission, result, and optional review fields describe that same attempt; splitting them into one-to-one tables would add joins without normalizing repeated data. Uploaded files already live in `test_attempt_files`. Answers and assessment payloads remain JSON because the API stores and returns them as submission documents; a separate per-question answer table is only warranted if question-level reporting or querying becomes a requirement.
 

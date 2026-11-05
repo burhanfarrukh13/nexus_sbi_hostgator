@@ -19,13 +19,35 @@ class TestSubmissionService
 
     public function __construct(
         private readonly PrivateFileStorage $storage,
-        private readonly TestAssessmentService $assessment
+        private readonly TestAssessmentService $assessment,
+        private readonly DocumentPageRenderer $renderer
     ) {
     }
 
-    public function submit(string $testId, string $studentId, mixed $answersInput, mixed $uploads): array
+    public function submit(
+        string $testId,
+        string $studentId,
+        mixed $answersInput,
+        mixed $uploads,
+        mixed $clientSubmissionId = null
+    ): array
     {
         $test = $this->requireStudentTestAccess($testId, $studentId);
+        if ($clientSubmissionId !== null &&
+            (!is_string($clientSubmissionId) || !Str::isUuid($clientSubmissionId))) {
+            throw new BadRequestHttpException('clientSubmissionId must be a UUID.');
+        }
+        if (is_string($clientSubmissionId)) {
+            $existing = DB::table('test_attempts')
+                ->where('testId', $testId)
+                ->where('studentId', $studentId)
+                ->where('client_submission_id', $clientSubmissionId)
+                ->whereNotNull('submitted_at')
+                ->first();
+            if ($existing) {
+                return $this->existingSubmissionResponse($existing);
+            }
+        }
         $questions = $this->decodeJson($test->questions, []);
         if ($questions === []) {
             throw new BadRequestHttpException('This test does not contain online questions.');
@@ -44,18 +66,14 @@ class TestSubmissionService
 
         usort($questions, static fn (array $a, array $b): int => (int) $a['questionNumber'] <=> (int) $b['questionNumber']);
         $completePaper = count(array_filter($prepared, static fn (array $file): bool => in_array($file['category'], ['paper', 'paper-page'], true))) > 0;
-        $questionFileNumbers = array_column(array_filter($prepared, static fn (array $file): bool => $file['category'] === 'question'), 'questionNumber');
-        if (!$completePaper) {
-            foreach ($questions as $question) {
-                $number = (int) $question['questionNumber'];
-                if (!array_key_exists($number, $answerMap) && !in_array($number, $questionFileNumbers, true)) {
-                    throw new BadRequestHttpException('Submit an answer or an answer file for every question.');
-                }
-            }
-        }
+        $questionFileNumbers = array_filter($prepared, static fn (array $file): bool => $file['category'] === 'question');
+        $hasTypedAnswers = array_filter($answers, static fn (array $answer): bool =>
+            trim((string) ($answer['answerText'] ?? '')) !== '' ||
+            !empty($answer['answerDelta'])
+        ) !== [];
         if ($completePaper && (
             $questionFileNumbers !== [] ||
-            array_filter($answers, static fn (array $answer): bool => trim((string) ($answer['answerText'] ?? '')) !== '') !== []
+            $hasTypedAnswers
         )) {
             throw new BadRequestHttpException('Submit either one complete paper or answers/files for each question, not both.');
         }
@@ -73,8 +91,10 @@ class TestSubmissionService
             if ($file['category'] === 'question') {
                 $number = $file['questionNumber'];
                 $existing = trim((string) ($answerTexts[$number] ?? ''));
-                if ($existing === '') {
-                    $answerTexts[$number] = $file['extractedText'];
+                if ($file['extractedText'] !== '') {
+                    $answerTexts[$number] = $existing === ''
+                        ? $file['extractedText']
+                        : $existing."\n\n".$file['extractedText'];
                 }
             } else {
                 $fullPaperTexts[] = $file['extractedText'];
@@ -94,7 +114,7 @@ class TestSubmissionService
         $storedKeys = [];
         $oldKeys = [];
         try {
-            $result = DB::transaction(function () use ($test, $studentId, $questions, $answerMap, $prepared, $completePaper, &$storedKeys, &$oldKeys): array {
+            $result = DB::transaction(function () use ($test, $studentId, $questions, $answerMap, $answerTexts, $prepared, $completePaper, $clientSubmissionId, &$storedKeys, &$oldKeys): array {
                 $now = now();
                 DB::table('test_attempts')->insertOrIgnore([
                     'id' => (string) Str::uuid(),
@@ -114,12 +134,17 @@ class TestSubmissionService
                     throw new NotFoundHttpException('Could not create test attempt.');
                 }
 
+                if (in_array($attempt->status, ['PROCESSING', 'COMPLETED', 'SUBMITTED'], true) || $attempt->submitted_at !== null) {
+                    if (is_string($clientSubmissionId) &&
+                        $attempt->client_submission_id === $clientSubmissionId &&
+                        $attempt->submitted_at !== null) {
+                        return $this->existingSubmissionResponse($attempt) + ['_idempotent' => true];
+                    }
+                    throw new BadRequestHttpException('This test has already been submitted or is being graded.');
+                }
                 $cutoff = $attempt->deadline_override_at ?? $test->deadline_at;
                 if ($cutoff !== null && Carbon::parse($cutoff)->lessThanOrEqualTo(now())) {
                     throw new AccessDeniedHttpException('The test deadline has passed.');
-                }
-                if (in_array($attempt->status, ['PROCESSING', 'COMPLETED', 'SUBMITTED'], true) || $attempt->submitted_at !== null) {
-                    throw new BadRequestHttpException('This test has already been submitted or is being graded.');
                 }
 
                 $oldKeys = DB::table('test_attempt_files')
@@ -181,11 +206,14 @@ class TestSubmissionService
                     'appeared' => true,
                     'submission_mode' => $completePaper ? 'COMPLETE_PAPER' : 'PER_QUESTION',
                     'submitted_at' => $now,
+                    'draft_answers' => null,
+                    'client_submission_id' => $clientSubmissionId,
                     'marksObtained' => null,
                     'deficiencyNotes' => null,
                     'ai_assessment' => null,
                     'submitted_answers' => json_encode($submittedAnswers, JSON_THROW_ON_ERROR),
                     'grading_error' => null,
+                    'grading_attempts' => 0,
                     'review_note' => null,
                     'review_submitted_at' => null,
                     'review_resolution' => null,
@@ -216,12 +244,19 @@ class TestSubmissionService
             } catch (\Throwable) {
             }
         }
+        if (($result['_idempotent'] ?? false) === true) {
+            unset($result['_idempotent']);
+            return $result;
+        }
 
-        if (array_filter($prepared, static fn (array $file): bool => str_starts_with($file['mimeType'], 'image/')) !== []) {
+        $hasMedia = array_filter($prepared, static fn (array $file): bool =>
+            str_starts_with($file['mimeType'], 'image/') || $file['mimeType'] === 'application/pdf'
+        ) !== [];
+        if ($hasMedia || (bool) config('services.grading.queue_typed', true)) {
             return $result + [
                 'gradingPending' => true,
                 'gradingQueued' => true,
-                'gradingMessage' => 'Your answers were saved. AI is processing the uploaded answer pages; results will appear when grading is complete.',
+                'gradingMessage' => 'Your answers are saved. You can close this page; your result will appear in My Tests when it is ready.',
             ];
         }
 
@@ -233,16 +268,94 @@ class TestSubmissionService
                 'resultAvailableAt' => $assessment['resultAvailableAt'] ?? null,
             ];
         } catch (\RuntimeException $error) {
-            $message = str_contains(strtolower($error->getMessage()), 'manual review') ||
-                str_contains(strtolower($error->getMessage()), 'readable answer text')
-                ? 'Your submission was saved, but AI could not read answers from the uploaded file. Upload clearer page images or type answers in the answer boxes; an administrator can also grade it manually.'
-                : 'Your answers were saved, but automated grading could not complete. An administrator can review and retry it.';
+            $retryable = $this->assessment->isRetryableFailure($error);
+            $requeued = $retryable && $this->assessment->requeueAfterBackgroundFailure(
+                (string) $result['attemptId'],
+                $error->getMessage()
+            );
 
-            return $result + [
+            return array_merge($result, [
+                'status' => 'SUBMITTED',
                 'gradingPending' => true,
-                'gradingMessage' => $message,
-            ];
+                'gradingQueued' => $requeued,
+                'gradingMessage' => $requeued
+                    ? 'Your answers are saved. You can close this page; your result will appear in My Tests when it is ready.'
+                    : 'Your answers are saved. A teacher will check them.',
+            ]);
         }
+    }
+
+    public function saveDraft(string $testId, string $studentId, mixed $answersInput): array
+    {
+        $test = $this->requireStudentTestAccess($testId, $studentId);
+        $questions = $this->decodeJson($test->questions, []);
+        $questionNumbers = array_fill_keys(array_map(
+            static fn (array $question): int => (int) $question['questionNumber'],
+            $questions
+        ), true);
+        $answers = $this->parseAnswers($answersInput);
+        $seen = [];
+        foreach ($answers as $answer) {
+            if (!isset($questionNumbers[$answer['questionNumber']]) ||
+                isset($seen[$answer['questionNumber']])) {
+                throw new BadRequestHttpException('Draft answers must reference each test question at most once.');
+            }
+            $seen[$answer['questionNumber']] = true;
+        }
+
+        DB::table('test_attempts')->insertOrIgnore([
+            'id' => (string) Str::uuid(),
+            'testId' => $testId,
+            'studentId' => $studentId,
+            'appeared' => false,
+            'status' => 'NOT_ATTEMPTED',
+            'createdAt' => now(),
+            'updatedAt' => now(),
+        ]);
+        $savedAt = now();
+        $updated = DB::transaction(function () use ($testId, $studentId, $answers, $savedAt): bool {
+            $attempt = DB::table('test_attempts')
+                ->where('testId', $testId)
+                ->where('studentId', $studentId)
+                ->lockForUpdate()
+                ->first();
+            if (!$attempt || $attempt->submitted_at !== null ||
+                in_array($attempt->status, ['SUBMITTED', 'PROCESSING', 'COMPLETED'], true)) {
+                return false;
+            }
+            DB::table('test_attempts')->where('id', $attempt->id)->update([
+                'draft_answers' => json_encode($answers, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+                'status' => 'IN_PROGRESS',
+                'updatedAt' => $savedAt,
+            ]);
+
+            return true;
+        });
+
+        return [
+            'saved' => $updated,
+            'savedAt' => $updated ? $savedAt->utc()->toISOString() : null,
+        ];
+    }
+
+    private function existingSubmissionResponse(object $attempt): array
+    {
+        $completed = $attempt->status === 'COMPLETED' || $attempt->marksObtained !== null;
+
+        return [
+            'attemptId' => $attempt->id,
+            'status' => $completed ? 'COMPLETED' : 'SUBMITTED',
+            'submittedAt' => $attempt->submitted_at === null
+                ? null
+                : Carbon::parse($attempt->submitted_at)->toISOString(),
+            'gradingPending' => !$completed,
+            'gradingQueued' => !$completed && $attempt->status !== 'FAILED',
+            'gradingMessage' => $completed
+                ? 'Your saved answers have been checked.'
+                : ($attempt->status === 'FAILED'
+                    ? 'Your answers are saved. A teacher will check them.'
+                    : 'Your answers are saved. You can close this page; your result will appear in My Tests when it is ready.'),
+        ];
     }
 
     public function resubmit(string $testId, string $attemptId, string $studentId): array
@@ -265,11 +378,8 @@ class TestSubmissionService
             throw new BadRequestHttpException('Only a failed submission with saved answers can be resubmitted.');
         }
 
-        try {
-            return $this->assessment->gradeAttempt($testId, $attemptId);
-        } catch (\RuntimeException $error) {
-            throw new HttpException(503, $error->getMessage(), $error);
-        }
+        // Grading happens in the background worker; never inside this web request.
+        return $this->assessment->requeueAttempt($testId, $attemptId, $studentId);
     }
 
     private function requireStudentTestAccess(string $testId, string $studentId): object
@@ -351,7 +461,7 @@ class TestSubmissionService
             $uploads = [$uploads];
         }
         if (!is_array($uploads) || count($uploads) > self::MAX_FILES) {
-            throw new BadRequestHttpException('At most 10 files may be submitted.');
+            throw new BadRequestHttpException('At most '.self::MAX_FILES.' files may be submitted.');
         }
         foreach ($uploads as $file) {
             if (!$file instanceof UploadedFile || !$file->isValid()) {
@@ -459,7 +569,10 @@ class TestSubmissionService
                 'category' => $category,
                 'questionNumber' => $questionNumber,
                 'pageNumber' => $pageNumber,
-                'extractedText' => $this->extractText($extension, $bytes, $upload->getRealPath()),
+                // PDF text extraction and page counting are deferred to the worker.
+                // The web request only verifies its signature and stores the file.
+                'extractedText' => $extension === 'pdf' ? '' : $this->extractText($extension, $bytes, $upload->getRealPath()),
+                'pageCount' => null,
             ];
         }
 
@@ -507,13 +620,27 @@ class TestSubmissionService
     {
         $imageCount = 0;
         foreach ($prepared as $file) {
-            if (str_starts_with($file['mimeType'], 'image/')) {
-                $imageCount++;
-            }
+            $imageCount += str_starts_with($file['mimeType'], 'image/')
+                ? 1
+                : (int) ($file['pageCount'] ?? 0);
         }
         if ($imageCount > 30) {
             throw new BadRequestHttpException('An exam can include at most 30 page images across photos and PDF pages.');
         }
+    }
+
+    private function pdfPageCount(string $bytes): ?int
+    {
+        try {
+            $count = count((new \Smalot\PdfParser\Parser())->parseContent($bytes)->getPages());
+        } catch (\Throwable) {
+            return null;
+        }
+        if ($count < 1 || $count > DocumentPageRenderer::MAX_PAGES) {
+            throw new BadRequestHttpException('PDF answer files must contain between 1 and 30 pages.');
+        }
+
+        return $count;
     }
 
     private function decodeJson(mixed $value, array $fallback): array

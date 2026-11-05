@@ -4,12 +4,16 @@ namespace App\Http\Controllers;
 
 use App\Services\CloudChatClient;
 use App\Services\CloudEmbeddingClient;
+use App\Services\ImageCompactor;
 use App\Services\PrivateFileStorage;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
+use Carbon\Carbon;
 use RuntimeException;
 use Smalot\PdfParser\Parser as PdfParser;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
@@ -19,12 +23,16 @@ class AiNotebookController
 {
     private const CHUNK_LENGTH = 1600;
     private const CHUNK_OVERLAP = 240;
-    private const DAILY_REQUEST_LIMIT = 20;
+    private const DEFAULT_DAILY_REQUEST_LIMIT = 15;
+    private const MAX_SUBJECT_CHUNKS = 3000;
+    private const CHAT_TICKET_TTL_SECONDS = 120;
+    private const CHAT_PROCESSING_STALE_SECONDS = 360;
 
     public function __construct(
         private readonly PrivateFileStorage $storage,
         private readonly CloudEmbeddingClient $embeddings,
-        private readonly CloudChatClient $chatClient
+        private readonly CloudChatClient $chatClient,
+        private readonly ImageCompactor $imageCompactor
     ) {
     }
 
@@ -55,6 +63,45 @@ class AiNotebookController
         return response()->json($sources->map(fn (object $source): array => $this->sourceResponse($source))->all());
     }
 
+    public function sourceChunks(Request $request, string $sourceId): JsonResponse
+    {
+        $input = $request->validate([
+            'afterOrdinal' => ['sometimes', 'integer', 'min:0'],
+            'limit' => ['sometimes', 'integer', 'min:1', 'max:1000'],
+        ]);
+        $source = DB::table('ai_notebook_sources')->where('id', $sourceId)->first();
+        if (!$source) {
+            throw new NotFoundHttpException('Notebook source not found.');
+        }
+        $this->ensureSubjectAccessible($request, $source->subject_id, true);
+        if ($source->status !== 'ready') {
+            throw new \Symfony\Component\HttpKernel\Exception\BadRequestHttpException('Notebook source is not ready for caching.');
+        }
+        $limit = min(200, (int) ($input['limit'] ?? 200));
+        $rows = DB::table('ai_notebook_chunks')
+            ->where('source_id', $sourceId)
+            ->where('ordinal', '>=', (int) ($input['afterOrdinal'] ?? 0))
+            ->orderBy('ordinal')
+            ->limit($limit + 1)
+            ->get(['id', 'ordinal', 'content']);
+        $hasMore = $rows->count() > $limit;
+        $chunks = $rows->take($limit)->map(static fn (object $chunk): array => [
+            'id' => $chunk->id,
+            'ordinal' => (int) $chunk->ordinal,
+            'content' => $chunk->content,
+        ])->all();
+
+        return response()->json([
+            'sourceId' => $sourceId,
+            'subjectId' => $source->subject_id,
+            'title' => $source->title,
+            'createdAt' => $source->created_at,
+            'totalChunks' => (int) $source->total_chunks,
+            'chunks' => $chunks,
+            'nextOrdinal' => $hasMore ? $chunks[count($chunks) - 1]['ordinal'] + 1 : null,
+        ]);
+    }
+
     public function storeSource(Request $request): JsonResponse
     {
         $input = $request->validate([
@@ -83,6 +130,15 @@ class AiNotebookController
         }
         if (count($chunks) > 5000) {
             return response()->json(['message' => 'The document is too large to index safely.'], 422);
+        }
+        $existingChunks = (int) DB::table('ai_notebook_chunks as chunk')
+            ->join('ai_notebook_sources as source', 'source.id', '=', 'chunk.source_id')
+            ->where('source.subject_id', $subjectId)
+            ->count();
+        if ($existingChunks + count($chunks) > self::MAX_SUBJECT_CHUNKS) {
+            return response()->json([
+                'message' => 'This subject has reached the safe Notebook indexing limit. An administrator can remove unused sources before adding more material.',
+            ], 422);
         }
         if (!$this->embeddingsConfigured()) {
             return response()->json([
@@ -197,27 +253,281 @@ class AiNotebookController
     public function chat(Request $request): JsonResponse
     {
         $input = $request->validate([
-            'subjectId' => ['required', 'uuid'],
-            'question' => ['required', 'string', 'min:1', 'max:4000'],
+            'clientRequestId' => ['required', 'uuid'],
+            'subjectId' => ['sometimes', 'uuid'],
+            'question' => ['sometimes', 'nullable', 'string', 'max:4000'],
             'sessionId' => ['sometimes', 'uuid'],
             'studyAidMode' => ['sometimes', 'nullable', 'in:summary,mind_map'],
+            'image' => ['sometimes', 'file', 'mimes:jpg,jpeg,png,webp', 'max:10240'],
         ]);
         $identity = $this->identity($request);
-        $subjectId = $input['subjectId'];
-        $this->ensureSubjectAccessible($request, $subjectId);
-        $sessionId = $input['sessionId'] ?? null;
+        $userId = (string) $identity['userId'];
+        $clientRequestId = strtolower((string) $input['clientRequestId']);
+        $imageFile = $request->file('image');
+        $this->expireIdleChatTickets();
+
+        $ticket = DB::table('ai_notebook_chat_tickets')
+            ->where('user_id', $userId)
+            ->where('client_request_id', $clientRequestId)
+            ->first();
+        $newImageKey = null;
+        if ($ticket === null) {
+            if (!isset($input['subjectId'])) {
+                abort(422, 'Start a Notebook question before checking its status.');
+            }
+            $subjectId = (string) $input['subjectId'];
+            $this->ensureSubjectAccessible($request, $subjectId);
+            $question = trim((string) ($input['question'] ?? ''));
+            if ($question === '' && !$imageFile) {
+                throw new \Symfony\Component\HttpKernel\Exception\BadRequestHttpException('Enter a question or attach a photo.');
+            }
+            if (!empty($input['studyAidMode']) && $imageFile) {
+                throw new \Symfony\Component\HttpKernel\Exception\BadRequestHttpException('Remove the attached photo before requesting a study aid.');
+            }
+            $sessionId = $input['sessionId'] ?? null;
+            if ($sessionId !== null) {
+                $session = DB::table('ai_notebook_chat_sessions')
+                    ->where('id', $sessionId)
+                    ->where('user_id', $userId)
+                    ->where('subject_id', $subjectId)
+                    ->first();
+                if (!$session) {
+                    throw new NotFoundHttpException('Notebook session not found.');
+                }
+            }
+
+            $userQuestion = $question !== ''
+                ? $question
+                : 'Analyze the attached photo using relevant information from this subject notebook.';
+            if ($imageFile) {
+                $newImageKey = $this->storage->store($imageFile, 'ai-notebook-chat');
+            }
+            try {
+                $created = DB::transaction(function () use (
+                    $identity,
+                    $userId,
+                    $clientRequestId,
+                    $subjectId,
+                    $sessionId,
+                    $userQuestion,
+                    $input,
+                    $newImageKey
+                ): array {
+                    $existing = DB::table('ai_notebook_chat_tickets')
+                        ->where('user_id', $userId)
+                        ->where('client_request_id', $clientRequestId)
+                        ->lockForUpdate()
+                        ->first();
+                    if ($existing) {
+                        return ['ticket' => $existing, 'created' => false];
+                    }
+
+                    // Reserve at admission so concurrent queued questions cannot
+                    // overshoot the student's daily limit.
+                    $usage = ($identity['role'] ?? null) === 'student'
+                        ? $this->reserveUsage($userId)
+                        : null;
+                    $now = now();
+                    $id = (string) Str::uuid();
+                    DB::table('ai_notebook_chat_tickets')->insert([
+                        'id' => $id,
+                        'user_id' => $userId,
+                        'client_request_id' => $clientRequestId,
+                        'subject_id' => $subjectId,
+                        'session_id' => $sessionId,
+                        'question' => $userQuestion,
+                        'study_aid_mode' => $input['studyAidMode'] ?? null,
+                        'image_storage_key' => $newImageKey,
+                        'usage_date' => $usage['date'] ?? null,
+                        'usage_reserved' => $usage !== null,
+                        'status' => 'pending',
+                        'response_json' => null,
+                        'queued_at' => $now->format('Y-m-d H:i:s.u'),
+                        'last_checked_at' => $now,
+                        'processing_at' => null,
+                        'completed_at' => null,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ]);
+
+                    return [
+                        'ticket' => DB::table('ai_notebook_chat_tickets')->where('id', $id)->first(),
+                        'created' => true,
+                    ];
+                });
+            } catch (QueryException $exception) {
+                $this->deletePrivateFileQuietly($newImageKey);
+                $ticket = DB::table('ai_notebook_chat_tickets')
+                    ->where('user_id', $userId)
+                    ->where('client_request_id', $clientRequestId)
+                    ->first();
+                if (!$ticket) {
+                    throw $exception;
+                }
+                $created = ['ticket' => $ticket, 'created' => false];
+            } catch (\Throwable $exception) {
+                $this->deletePrivateFileQuietly($newImageKey);
+                throw $exception;
+            }
+            $ticket = $created['ticket'];
+            if (!$created['created'] && $newImageKey !== null) {
+                $this->deletePrivateFileQuietly($newImageKey);
+            }
+        } else {
+            $this->ensureSubjectAccessible($request, $ticket->subject_id);
+            $ticket = DB::transaction(function () use ($ticket, $userId, $identity): object {
+                $locked = DB::table('ai_notebook_chat_tickets')
+                    ->where('id', $ticket->id)
+                    ->where('user_id', $userId)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$locked) {
+                    throw new NotFoundHttpException('Notebook request not found.');
+                }
+                if ($locked->status === 'expired') {
+                    $usage = ($identity['role'] ?? null) === 'student'
+                        ? $this->reserveUsage($userId)
+                        : null;
+                    $now = now();
+                    DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->update([
+                        'status' => 'pending',
+                        'usage_date' => $usage['date'] ?? null,
+                        'usage_reserved' => $usage !== null,
+                        'queued_at' => $now->format('Y-m-d H:i:s.u'),
+                        'last_checked_at' => $now,
+                        'processing_at' => null,
+                        'updated_at' => $now,
+                    ]);
+                } else {
+                    DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->update([
+                        'last_checked_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                }
+
+                return DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->first();
+            });
+        }
+
+        if ($ticket->status === 'completed') {
+            return $this->completedChatResponse($ticket);
+        }
+
+        $slot = null;
+        try {
+            $claim = DB::transaction(function () use ($ticket, $identity, $userId, &$slot): array {
+                $locked = DB::table('ai_notebook_chat_tickets')
+                    ->where('id', $ticket->id)
+                    ->where('user_id', $userId)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$locked || $locked->status === 'completed') {
+                    return ['ticket' => $locked, 'process' => false];
+                }
+                if ($locked->status === 'processing' &&
+                    $locked->processing_at !== null &&
+                    Carbon::parse($locked->processing_at)->lessThanOrEqualTo(now()->subSeconds(self::CHAT_PROCESSING_STALE_SECONDS))) {
+                    if ((bool) $locked->usage_reserved && $locked->usage_date !== null) {
+                        $this->refundUsage($userId, $locked->usage_date);
+                    }
+                    DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->update([
+                        'status' => 'pending',
+                        'usage_reserved' => false,
+                        'processing_at' => null,
+                        'last_checked_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                    $locked = DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->first();
+                }
+                if ($locked->status !== 'pending') {
+                    return ['ticket' => $locked, 'process' => false];
+                }
+
+                $head = DB::table('ai_notebook_chat_tickets')
+                    ->where('status', 'pending')
+                    ->where('last_checked_at', '>', now()->subSeconds(self::CHAT_TICKET_TTL_SECONDS))
+                    ->orderBy('queued_at')
+                    ->orderBy('id')
+                    ->lockForUpdate()
+                    ->first();
+                if (!$head || $head->id !== $locked->id) {
+                    return ['ticket' => $locked, 'process' => false];
+                }
+
+                $slot = $this->storage->acquireChatSlot();
+                if ($slot === null) {
+                    return ['ticket' => $locked, 'process' => false];
+                }
+                if (($identity['role'] ?? null) === 'student' && !(bool) $locked->usage_reserved) {
+                    $usage = $this->reserveUsage($userId);
+                    DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->update([
+                        'usage_date' => $usage['date'],
+                        'usage_reserved' => true,
+                    ]);
+                }
+                DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->update([
+                    'status' => 'processing',
+                    'processing_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+                return [
+                    'ticket' => DB::table('ai_notebook_chat_tickets')->where('id', $locked->id)->first(),
+                    'process' => true,
+                ];
+            });
+        } catch (\Throwable $exception) {
+            $this->storage->releaseChatSlot($slot);
+            throw $exception;
+        }
+
+        if (!$claim['process']) {
+            $this->storage->releaseChatSlot($slot);
+            if (($claim['ticket']->status ?? null) === 'completed') {
+                return $this->completedChatResponse($claim['ticket']);
+            }
+
+            return $this->waitingChatResponse();
+        }
+
+        try {
+            return $this->answerChatTicket($claim['ticket'], $identity);
+        } catch (\Throwable $exception) {
+            $this->refundAndRequeueChatTicket($claim['ticket']->id, $userId);
+
+            return $this->waitingChatResponse();
+        } finally {
+            $this->storage->releaseChatSlot($slot);
+        }
+    }
+
+    private function answerChatTicket(object $ticket, array $identity): JsonResponse
+    {
+        $subjectId = $ticket->subject_id;
+        $sessionId = $ticket->session_id;
         $session = $sessionId === null
             ? null
             : DB::table('ai_notebook_chat_sessions')
                 ->where('id', $sessionId)
                 ->where('user_id', $identity['userId'])
+                ->where('subject_id', $subjectId)
                 ->first();
-        if ($sessionId !== null && (!$session || $session->subject_id !== $subjectId)) {
-            throw new NotFoundHttpException('Notebook session not found.');
+        if ($sessionId !== null && !$session) {
+            $sessionId = null;
         }
 
-        $this->recordUsage($identity['userId']);
-        $retrieved = $this->retrieveChunks($subjectId, $input['question']);
+        $image = null;
+        if ($ticket->image_storage_key !== null) {
+            $imagePath = $this->storage->resolve($ticket->image_storage_key);
+            $imageBytes = file_get_contents($imagePath);
+            if (!is_string($imageBytes)) {
+                throw new RuntimeException('The attached photo could not be read.');
+            }
+            $image = $this->imageCompactor->compact($imageBytes);
+        }
+
+        $userQuestion = $ticket->question;
+        $retrieved = $this->retrieveChunks($subjectId, $userQuestion);
         $subject = DB::table('subjects')->where('id', $subjectId)->first();
         $defaultPrompt = DB::table('ai_notebook_prompts')->where('subject_id', $subjectId)->first();
         $personalPrompt = DB::table('ai_notebook_user_prompts')
@@ -234,10 +544,10 @@ class AiNotebookController
             'Do not invent citations. Respond in '.str_replace('_', ' ', $language).'. '.
             $prompt
         );
-        if (($input['studyAidMode'] ?? null) === 'summary') {
-            $instructions .= ' Present the response as a concise study summary.';
-        } elseif (($input['studyAidMode'] ?? null) === 'mind_map') {
-            $instructions .= ' Present a hierarchical mind map in readable text.';
+        if ($ticket->study_aid_mode === 'summary') {
+            $instructions .= ' Create a concise, well-organized study summary using only source excerpts, with a main idea, key concepts, and short recap.';
+        } elseif ($ticket->study_aid_mode === 'mind_map') {
+            $instructions .= ' Create a visual study mind map using only source excerpts. Return raw JSON only with exactly {"title":"short topic title","branches":[{"label":"main idea","children":[{"label":"supporting idea","children":[]}]}]}. Each node has a concise string label and children array. Use 2-12 top-level branches, up to 8 children per node, and no more than 96 nodes. Do not invent unsupported facts.';
         }
 
         $context = implode("\n\n", array_map(
@@ -258,28 +568,54 @@ class AiNotebookController
                 ->reverse()
                 ->map(static fn (object $message): array => [
                     'role' => $message->role,
-                    'content' => $message->content,
+                    'content' => preg_replace('/\s*<!--nexus-study-aid:[A-Za-z0-9+\/=]+-->/', '', $message->content) ?? $message->content,
                 ])->all();
 
-        try {
-            $answer = $this->chatClient->complete([
+        $answer = $this->chatClient->complete([
                 ['role' => 'system', 'content' => $instructions."\n\nSOURCE EXCERPTS:\n".$context],
                 ...$history,
-                ['role' => 'user', 'content' => $input['question']],
-            ]);
-        } catch (RuntimeException $exception) {
-            return response()->json(['message' => $exception->getMessage()], 503);
+                ['role' => 'user', 'content' => $image === null
+                    ? $userQuestion
+                    : [
+                        ['type' => 'text', 'text' => $userQuestion],
+                        ['type' => 'image_url', 'image_url' => ['url' => 'data:'.$image['mimeType'].';base64,'.base64_encode($image['buffer'])]],
+                    ]],
+            ], $ticket->study_aid_mode === 'mind_map', (int) config('services.ai_chat.notebook_timeout', 60));
+        $studyAid = null;
+        if ($ticket->study_aid_mode === 'mind_map') {
+            $studyAid = $this->parseMindMap($answer);
+            $answer = 'Mind map: '.$studyAid['title'];
+        } elseif ($ticket->study_aid_mode === 'summary') {
+            $studyAid = ['type' => 'summary'];
         }
 
         $sessionId ??= (string) Str::uuid();
         $now = now();
-        DB::transaction(function () use ($session, $sessionId, $subjectId, $identity, $input, $answer, $retrieved, $now): void {
+        $storedAnswer = $answer;
+        if (($studyAid['type'] ?? null) === 'mind_map') {
+            $storedAnswer .= "\n\n<!--nexus-study-aid:".base64_encode(json_encode($studyAid, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE)).'-->';
+        }
+        $citations = array_map(static fn (array $item): array => [
+            'sourceId' => $item['sourceId'],
+            'title' => $item['title'],
+            'chunk' => $item['ordinal'] + 1,
+        ], $retrieved);
+        $responseData = [
+            'sessionId' => $sessionId,
+            'answer' => $answer,
+            'response' => $answer,
+            'message' => $answer,
+            'content' => $answer,
+            'citations' => $citations,
+            'studyAid' => $studyAid,
+        ];
+        DB::transaction(function () use ($session, $sessionId, $subjectId, $identity, $userQuestion, $storedAnswer, $citations, $now, $image, $ticket, $responseData): void {
             if ($session === null) {
                 DB::table('ai_notebook_chat_sessions')->insert([
                     'id' => $sessionId,
                     'subject_id' => $subjectId,
                     'user_id' => $identity['userId'],
-                    'title' => Str::limit($input['question'], 120, ''),
+                    'title' => Str::limit($userQuestion, 120, ''),
                     'created_at' => $now,
                     'updated_at' => $now,
                 ]);
@@ -288,14 +624,9 @@ class AiNotebookController
                     'updated_at' => $now,
                 ]);
             }
-            $citations = array_map(static fn (array $item): array => [
-                'sourceId' => $item['sourceId'],
-                'title' => $item['title'],
-                'chunk' => $item['ordinal'] + 1,
-            ], $retrieved);
             foreach ([
-                ['role' => 'user', 'content' => $input['question'], 'citations' => []],
-                ['role' => 'assistant', 'content' => $answer, 'citations' => $citations],
+                ['role' => 'user', 'content' => $userQuestion.($image === null ? '' : "\n[Photo attached]"), 'citations' => []],
+                ['role' => 'assistant', 'content' => $storedAnswer, 'citations' => $citations],
             ] as $message) {
                 DB::table('ai_notebook_chat_messages')->insert([
                     'id' => (string) Str::uuid(),
@@ -306,23 +637,126 @@ class AiNotebookController
                     'created_at' => $now,
                 ]);
             }
+            $updated = DB::table('ai_notebook_chat_tickets')
+                ->where('id', $ticket->id)
+                ->where('user_id', $identity['userId'])
+                ->where('status', 'processing')
+                ->update([
+                    'status' => 'completed',
+                    'response_json' => json_encode($responseData, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+                    'usage_reserved' => false,
+                    'processing_at' => null,
+                    'completed_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            if ($updated !== 1) {
+                throw new RuntimeException('Notebook response could not be saved.');
+            }
         });
 
-        return response()->json([
-            'sessionId' => $sessionId,
-            'answer' => $answer,
-            'response' => $answer,
-            'message' => $answer,
-            'content' => $answer,
-            'citations' => array_map(static fn (array $item): array => [
-                'sourceId' => $item['sourceId'],
-                'title' => $item['title'],
-                'chunk' => $item['ordinal'] + 1,
-            ], $retrieved),
-            'studyAid' => ($input['studyAidMode'] ?? null) === null
-                ? null
-                : ['type' => $input['studyAidMode']],
-        ]);
+        if ($ticket->image_storage_key !== null && $this->deletePrivateFileQuietly($ticket->image_storage_key)) {
+            DB::table('ai_notebook_chat_tickets')->where('id', $ticket->id)->update([
+                'image_storage_key' => null,
+                'updated_at' => now(),
+            ]);
+        }
+
+        return response()->json($responseData);
+    }
+
+    private function refundAndRequeueChatTicket(string $ticketId, string $userId): void
+    {
+        try {
+            DB::transaction(function () use ($ticketId, $userId): void {
+                $ticket = DB::table('ai_notebook_chat_tickets')
+                    ->where('id', $ticketId)
+                    ->where('user_id', $userId)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$ticket || $ticket->status !== 'processing') {
+                    return;
+                }
+                if ((bool) $ticket->usage_reserved && $ticket->usage_date !== null) {
+                    $this->refundUsage($userId, $ticket->usage_date);
+                }
+                DB::table('ai_notebook_chat_tickets')->where('id', $ticketId)->update([
+                    'status' => 'pending',
+                    'usage_reserved' => false,
+                    'processing_at' => null,
+                    'last_checked_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            });
+        } catch (\Throwable) {
+            // Keep the original question private and let a later idempotent retry
+            // recover a transient persistence failure without logging user data.
+        }
+    }
+
+    private function expireIdleChatTickets(): void
+    {
+        $cutoff = now()->subSeconds(self::CHAT_TICKET_TTL_SECONDS);
+        $staleTickets = DB::table('ai_notebook_chat_tickets')
+            ->where('status', 'pending')
+            ->where('last_checked_at', '<=', $cutoff)
+            ->orderBy('last_checked_at')
+            ->limit(100)
+            ->get(['id', 'user_id', 'usage_date', 'usage_reserved']);
+
+        foreach ($staleTickets as $stale) {
+            DB::transaction(function () use ($stale, $cutoff): void {
+                $ticket = DB::table('ai_notebook_chat_tickets')
+                    ->where('id', $stale->id)
+                    ->where('status', 'pending')
+                    ->where('last_checked_at', '<=', $cutoff)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$ticket) {
+                    return;
+                }
+                if ((bool) $ticket->usage_reserved && $ticket->usage_date !== null) {
+                    $this->refundUsage($ticket->user_id, $ticket->usage_date);
+                }
+                DB::table('ai_notebook_chat_tickets')->where('id', $ticket->id)->update([
+                    'status' => 'expired',
+                    'usage_reserved' => false,
+                    'processing_at' => null,
+                    'updated_at' => now(),
+                ]);
+            });
+        }
+    }
+
+    private function completedChatResponse(object $ticket): JsonResponse
+    {
+        $payload = json_decode((string) $ticket->response_json, true);
+
+        return is_array($payload)
+            ? response()->json($payload)
+            : $this->waitingChatResponse();
+    }
+
+    private function waitingChatResponse(): JsonResponse
+    {
+        // This payload is intentionally free of queue position, count, ordinal,
+        // depth, or "ahead" information.
+        return response()->json(['retryAfterSeconds' => 4], 202);
+    }
+
+    private function deletePrivateFileQuietly(?string $key): bool
+    {
+        if ($key === null) {
+            return true;
+        }
+        try {
+            $this->storage->delete($key);
+
+            return true;
+        } catch (\Throwable) {
+            // Private file cleanup is best effort; never log question/photo data.
+
+            return false;
+        }
     }
 
     public function session(Request $request, string $id): JsonResponse
@@ -347,13 +781,7 @@ class AiNotebookController
             'title' => $session->title,
             'createdAt' => $session->created_at,
             'updatedAt' => $session->updated_at,
-            'messages' => $messages->map(static fn (object $message): array => [
-                'id' => $message->id,
-                'role' => $message->role,
-                'content' => $message->content,
-                'citations' => json_decode($message->citations, true) ?: [],
-                'createdAt' => $message->created_at,
-            ])->all(),
+            'messages' => $messages->map(fn (object $message): array => $this->messageResponse($message))->all(),
         ]);
     }
 
@@ -390,6 +818,10 @@ class AiNotebookController
             'defaultPrompt' => $default?->prompt ?? '',
             'defaultResponseLanguage' => $default?->response_language ?? 'english',
             'personalPrompt' => $personal?->prompt,
+            'defaultLanguage' => $default?->response_language ?? 'english',
+            'userPrompt' => $personal?->prompt ?: null,
+            'userLanguage' => $personal?->response_language,
+            'usesDefault' => $personal === null,
         ]);
     }
 
@@ -397,13 +829,28 @@ class AiNotebookController
     {
         $this->ensureSubjectAccessible($request, $subjectId);
         $input = $request->validate([
-            'prompt' => ['required', 'string', 'max:4000'],
-            'responseLanguage' => ['required', 'string', 'in:english,urdu,roman_urdu'],
+            'prompt' => ['sometimes', 'nullable', 'string', 'max:4000'],
+            'responseLanguage' => ['sometimes', 'nullable', 'string', 'in:english,urdu,roman_urdu'],
         ]);
         $userId = $this->identity($request)['userId'];
+        $existing = DB::table('ai_notebook_user_prompts')
+            ->where('subject_id', $subjectId)
+            ->where('user_id', $userId)
+            ->first();
+        $prompt = trim((string) ($input['prompt'] ?? ''));
+        if ($prompt === '' && empty($input['responseLanguage'])) {
+            DB::table('ai_notebook_user_prompts')
+                ->where('subject_id', $subjectId)
+                ->where('user_id', $userId)
+                ->delete();
+
+            return $this->prompt($request, $subjectId);
+        }
         $payload = [
-            'prompt' => $input['prompt'],
-            'response_language' => $input['responseLanguage'],
+            'prompt' => array_key_exists('prompt', $input)
+                ? $prompt
+                : ($existing->prompt ?? ''),
+            'response_language' => $input['responseLanguage'] ?? $existing->response_language ?? 'english',
             'updated_at' => now(),
         ];
         DB::table('ai_notebook_user_prompts')->updateOrInsert(
@@ -411,11 +858,18 @@ class AiNotebookController
             ['subject_id' => $subjectId, 'user_id' => $userId, ...$payload]
         );
 
-        return response()->json([
-            'subjectId' => $subjectId,
-            'prompt' => $payload['prompt'],
-            'responseLanguage' => $payload['response_language'],
-        ]);
+        return $this->prompt($request, $subjectId);
+    }
+
+    public function resetPersonalPrompt(Request $request, string $subjectId): JsonResponse
+    {
+        $this->ensureSubjectAccessible($request, $subjectId);
+        DB::table('ai_notebook_user_prompts')
+            ->where('subject_id', $subjectId)
+            ->where('user_id', $this->identity($request)['userId'])
+            ->delete();
+
+        return $this->prompt($request, $subjectId);
     }
 
     public function savePrompt(Request $request, string $subjectId): JsonResponse
@@ -441,6 +895,77 @@ class AiNotebookController
             'prompt' => $payload['prompt'],
             'responseLanguage' => $payload['response_language'],
         ]);
+    }
+
+    private function parseMindMap(string $response): array
+    {
+        $start = strpos($response, '{');
+        $end = strrpos($response, '}');
+        if ($start === false || $end === false || $end < $start) {
+            throw new RuntimeException('The notebook could not create a valid study mind map. Please try again.');
+        }
+        try {
+            $decoded = json_decode(substr($response, $start, $end - $start + 1), true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $error) {
+            throw new RuntimeException('The notebook could not create a valid study mind map. Please try again.', previous: $error);
+        }
+        if (!is_array($decoded) || !is_string($decoded['title'] ?? null) ||
+            trim($decoded['title']) === '' || !is_array($decoded['branches'] ?? null) ||
+            count($decoded['branches']) < 2 || count($decoded['branches']) > 12) {
+            throw new RuntimeException('The notebook returned an incomplete study mind map.');
+        }
+        $count = 0;
+        $branches = $this->validateMindMapNodes($decoded['branches'], 0, $count);
+
+        return [
+            'type' => 'mind_map',
+            'title' => mb_substr(trim($decoded['title']), 0, 120),
+            'branches' => $branches,
+        ];
+    }
+
+    private function validateMindMapNodes(array $nodes, int $depth, int &$count): array
+    {
+        if (($depth > 4 && $nodes !== []) || count($nodes) > 12) {
+            throw new RuntimeException('The notebook returned a study mind map that is too large.');
+        }
+        $validated = [];
+        foreach ($nodes as $node) {
+            if (!is_array($node) || !is_string($node['label'] ?? null) ||
+                trim($node['label']) === '' || !is_array($node['children'] ?? null) ||
+                count($node['children']) > 8 || ++$count > 96) {
+                throw new RuntimeException('The notebook returned an invalid study mind map.');
+            }
+            $validated[] = [
+                'label' => mb_substr(trim($node['label']), 0, 120),
+                'children' => $this->validateMindMapNodes($node['children'], $depth + 1, $count),
+            ];
+        }
+
+        return $validated;
+    }
+
+    private function messageResponse(object $message): array
+    {
+        $content = (string) $message->content;
+        $studyAid = null;
+        if (preg_match('/\s*<!--nexus-study-aid:([A-Za-z0-9+\/=]+)-->\s*$/', $content, $marker) === 1) {
+            $json = base64_decode($marker[1], true);
+            $decoded = is_string($json) ? json_decode($json, true) : null;
+            if (is_array($decoded) && ($decoded['type'] ?? null) === 'mind_map') {
+                $studyAid = $decoded;
+                $content = preg_replace('/\s*<!--nexus-study-aid:[A-Za-z0-9+\/=]+-->\s*$/', '', $content) ?? $content;
+            }
+        }
+
+        return [
+            'id' => $message->id,
+            'role' => $message->role,
+            'content' => $content,
+            'citations' => json_decode($message->citations, true) ?: [],
+            'createdAt' => $message->created_at,
+            ...($studyAid === null ? [] : ['studyAid' => $studyAid]),
+        ];
     }
 
     private function sourceResponse(object $source): array
@@ -525,7 +1050,6 @@ class AiNotebookController
                 'chunk.id',
                 'chunk.source_id',
                 'chunk.ordinal',
-                'chunk.content',
                 'chunk.embedding',
                 'chunk.embedding_model',
                 'source.title',
@@ -538,7 +1062,30 @@ class AiNotebookController
         if ($this->embeddingsConfigured() && $rows->contains(
             static fn (object $row): bool => $row->embedding_model !== 'lexical'
         )) {
-            $queryVector = $this->embeddings->embed([$question])['embeddings'][0];
+            try {
+                $normalizedQuestion = preg_replace('/\s+/u', ' ', mb_strtolower(trim($question))) ?? trim($question);
+                $cacheKey = 'ai-notebook:query-embedding:'.hash('sha256', implode('|', [
+                    (string) config('services.embeddings.model'),
+                    (string) config('services.embeddings.dimensions'),
+                    $normalizedQuestion,
+                ]));
+                $queryVector = Cache::remember(
+                    $cacheKey,
+                    now()->addMinutes(10),
+                    fn (): array => $this->embeddings->embed([$question])['embeddings'][0]
+                );
+            } catch (\Throwable $error) {
+                Log::warning('AI Notebook query embedding failed; using lexical retrieval.', [
+                    'exception' => $error::class,
+                ]);
+            }
+        }
+        $contentById = [];
+        if (!is_array($queryVector)) {
+            $contentById = DB::table('ai_notebook_chunks')
+                ->whereIn('id', $rows->pluck('id'))
+                ->pluck('content', 'id')
+                ->all();
         }
         $terms = array_values(array_unique(preg_split('/[^a-z0-9]+/i', mb_strtolower($question), -1, PREG_SPLIT_NO_EMPTY) ?: []));
         $ranked = [];
@@ -546,20 +1093,35 @@ class AiNotebookController
             $vector = json_decode($row->embedding, true);
             $score = is_array($queryVector) && is_array($vector) && $vector !== []
                 ? $this->cosineSimilarity($queryVector, $vector)
-                : $this->lexicalScore($terms, $row->content);
+                : $this->lexicalScore($terms, (string) ($contentById[$row->id] ?? ''));
             if ($score > 0) {
                 $ranked[] = [
+                    'id' => $row->id,
                     'sourceId' => $row->source_id,
                     'title' => $row->title,
                     'ordinal' => (int) $row->ordinal,
-                    'content' => $row->content,
+                    'content' => '',
                     'score' => $score,
                 ];
             }
         }
         usort($ranked, static fn (array $left, array $right): int => $right['score'] <=> $left['score']);
+        $top = array_slice($ranked, 0, 5);
+        if ($top === []) {
+            return [];
+        }
+        $contents = is_array($queryVector)
+            ? DB::table('ai_notebook_chunks')
+                ->whereIn('id', array_column($top, 'id'))
+                ->pluck('content', 'id')
+            : collect($contentById);
+        foreach ($top as &$item) {
+            $item['content'] = (string) ($contents[$item['id']] ?? '');
+            unset($item['id'], $item['score']);
+        }
+        unset($item);
 
-        return array_slice($ranked, 0, 5);
+        return $top;
     }
 
     private function cosineSimilarity(array $left, array $right): float
@@ -598,31 +1160,47 @@ class AiNotebookController
         return $score / max(1, count($terms));
     }
 
-    private function recordUsage(string $userId): void
+    private function reserveUsage(string $userId): array
     {
-        DB::transaction(function () use ($userId): void {
+        $date = Carbon::now((string) config('services.ai_notebook.day_reset_timezone', 'Asia/Karachi'))->toDateString();
+        $limit = (int) (DB::table('ai_grading_settings')->where('id', 1)->value('notebook_daily_question_limit')
+            ?? self::DEFAULT_DAILY_REQUEST_LIMIT);
+
+        return DB::transaction(function () use ($userId, $date, $limit): array {
             DB::table('ai_notebook_daily_usage')->insertOrIgnore([
                 'userId' => $userId,
-                'usageDate' => now()->toDateString(),
+                'usageDate' => $date,
                 'requestCount' => 0,
                 'updatedAt' => now(),
             ]);
             $usage = DB::table('ai_notebook_daily_usage')->where('userId', $userId)->lockForUpdate()->first();
-            if ($usage->usageDate !== now()->toDateString()) {
+            if ($usage->usageDate !== $date) {
                 DB::table('ai_notebook_daily_usage')->where('userId', $userId)->update([
-                    'usageDate' => now()->toDateString(),
+                    'usageDate' => $date,
                     'requestCount' => 1,
                     'updatedAt' => now(),
                 ]);
-            } elseif ((int) $usage->requestCount >= self::DAILY_REQUEST_LIMIT) {
-                abort(429, 'The daily AI Notebook request limit has been reached.');
+            } elseif ((int) $usage->requestCount >= $limit) {
+                $questionLabel = $limit === 1 ? 'question' : 'questions';
+                abort(429, "You've used all {$limit} AI Notebook {$questionLabel} for today. Your allowance resets at midnight.");
             } else {
                 DB::table('ai_notebook_daily_usage')->where('userId', $userId)->update([
                     'requestCount' => (int) $usage->requestCount + 1,
                     'updatedAt' => now(),
                 ]);
             }
+
+            return ['date' => $date];
         });
+    }
+
+    private function refundUsage(string $userId, string $date): void
+    {
+        DB::table('ai_notebook_daily_usage')
+            ->where('userId', $userId)
+            ->where('usageDate', $date)
+            ->where('requestCount', '>', 0)
+            ->decrement('requestCount');
     }
 
     private function embeddingsConfigured(): bool

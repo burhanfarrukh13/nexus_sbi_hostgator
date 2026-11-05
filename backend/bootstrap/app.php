@@ -3,6 +3,7 @@
 use App\Http\Middleware\AddSecurityHeaders;
 use App\Http\Middleware\AuthenticateApiToken;
 use App\Http\Middleware\CorsAllowlist;
+use App\Http\Middleware\PrivateEtagCache;
 use App\Http\Middleware\RequireAdminPermissions;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -35,6 +36,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'auth.compat' => AuthenticateApiToken::class,
             'permission.compat' => RequireAdminPermissions::class,
+            'cache.private-etag' => PrivateEtagCache::class,
         ]);
         $middleware->append(CorsAllowlist::class);
         $middleware->append(AddSecurityHeaders::class);

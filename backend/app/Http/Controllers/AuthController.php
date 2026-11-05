@@ -110,7 +110,7 @@ class AuthController
     {
         $input = $request->validate([
             'currentPassword' => ['required', 'string', 'min:1', 'max:200'],
-            'newPassword' => ['required', 'string', 'min:12', 'max:200'],
+            'newPassword' => ['required', 'string', 'min:12', 'max:200', 'different:currentPassword'],
         ]);
         $identity = $request->attributes->get('apiIdentity');
         $user = DB::table('users')->where('id', $identity['userId'])->first();

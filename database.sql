@@ -19,6 +19,7 @@ DROP TABLE IF EXISTS `subject_user_access`;
 DROP TABLE IF EXISTS `ai_notebook_daily_usage`;
 DROP TABLE IF EXISTS `ai_notebook_user_prompts`;
 DROP TABLE IF EXISTS `ai_notebook_prompts`;
+DROP TABLE IF EXISTS `ai_notebook_chat_tickets`;
 DROP TABLE IF EXISTS `ai_notebook_chat_messages`;
 DROP TABLE IF EXISTS `ai_notebook_chat_sessions`;
 DROP TABLE IF EXISTS `ai_notebook_chunks`;
@@ -175,9 +176,12 @@ CREATE TABLE `test_attempts` (
   `result_available_at` TIMESTAMP NULL,
   `submission_mode` VARCHAR(20) NULL,
   `submitted_answers` JSON NULL,
+  `draft_answers` JSON NULL,
+  `client_submission_id` CHAR(36) NULL,
   `ai_assessment` JSON NULL,
   `deficiencyNotes` TEXT NULL,
   `grading_error` TEXT NULL,
+  `grading_attempts` TINYINT UNSIGNED NOT NULL DEFAULT 0,
   `review_note` TEXT NULL,
   `review_submitted_at` TIMESTAMP NULL,
   `review_resolution` TEXT NULL,
@@ -185,6 +189,7 @@ CREATE TABLE `test_attempts` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_test_attempts_test_student` (`testId`, `studentId`),
   KEY `idx_test_attempts_student_status_request` (`studentId`, `status`, `access_requested_at`),
+  KEY `idx_test_attempts_grading_queue` (`status`, `grading_attempts`, `submitted_at`),
   CONSTRAINT `fk_test_attempts_test` FOREIGN KEY (`testId`) REFERENCES `tests` (`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_test_attempts_student` FOREIGN KEY (`studentId`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -278,6 +283,34 @@ CREATE TABLE `ai_notebook_chat_messages` (
   CONSTRAINT `chk_ai_notebook_messages_role` CHECK (`role` IN ('user', 'assistant'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `ai_notebook_chat_tickets` (
+  `id` CHAR(36) NOT NULL,
+  `user_id` CHAR(36) NOT NULL,
+  `client_request_id` CHAR(36) NOT NULL,
+  `subject_id` CHAR(36) NOT NULL,
+  `session_id` CHAR(36) NULL,
+  `question` LONGTEXT NOT NULL,
+  `study_aid_mode` VARCHAR(20) NULL,
+  `image_storage_key` VARCHAR(240) NULL,
+  `usage_date` DATE NULL,
+  `usage_reserved` TINYINT(1) NOT NULL DEFAULT 0,
+  `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
+  `response_json` LONGTEXT NULL,
+  `queued_at` TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  `last_checked_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `processing_at` TIMESTAMP NULL,
+  `completed_at` TIMESTAMP NULL,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ai_notebook_chat_ticket_owner_request` (`user_id`, `client_request_id`),
+  KEY `idx_ai_notebook_chat_tickets_fifo` (`status`, `queued_at`, `id`),
+  KEY `idx_ai_notebook_chat_tickets_expiry` (`status`, `last_checked_at`),
+  CONSTRAINT `fk_ai_notebook_chat_tickets_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_ai_notebook_chat_tickets_subject` FOREIGN KEY (`subject_id`) REFERENCES `subjects` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `chk_ai_notebook_chat_tickets_status` CHECK (`status` IN ('pending', 'processing', 'completed', 'expired'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE `ai_notebook_prompts` (
   `subject_id` CHAR(36) NOT NULL,
   `prompt` TEXT NOT NULL,
@@ -298,6 +331,9 @@ CREATE TABLE `ai_notebook_user_prompts` (
   CONSTRAINT `fk_ai_notebook_user_prompts_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- One row per user. usageDate is the day the counter applies to, and
+-- AiNotebookController::reserveUsage() resets requestCount at the configured day boundary,
+-- so the primary key is intentionally userId alone (not userId + usageDate).
 CREATE TABLE `ai_notebook_daily_usage` (
   `userId` CHAR(36) NOT NULL,
   `usageDate` DATE NOT NULL,
@@ -305,20 +341,22 @@ CREATE TABLE `ai_notebook_daily_usage` (
   `updatedAt` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`userId`),
   CONSTRAINT `fk_ai_notebook_daily_usage_user` FOREIGN KEY (`userId`) REFERENCES `users` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `chk_ai_notebook_daily_usage_count` CHECK (`requestCount` BETWEEN 0 AND 20)
+  CONSTRAINT `chk_ai_notebook_daily_usage_count` CHECK (`requestCount` BETWEEN 0 AND 1000)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `ai_grading_settings` (
   `id` TINYINT UNSIGNED NOT NULL,
   `deficiency_report_prompt` TEXT NOT NULL,
-  `result_release_delay_hours` SMALLINT UNSIGNED NOT NULL DEFAULT 24,
+  `result_release_delay_hours` SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+  `notebook_daily_question_limit` SMALLINT UNSIGNED NOT NULL DEFAULT 15,
   `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   CONSTRAINT `chk_ai_grading_settings_singleton` CHECK (`id` = 1)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO `ai_grading_settings` (`id`, `deficiency_report_prompt`, `result_release_delay_hours`) VALUES (
+INSERT INTO `ai_grading_settings` (`id`, `deficiency_report_prompt`, `result_release_delay_hours`, `notebook_daily_question_limit`) VALUES (
   1,
   'Review the student work fairly, highlight the strongest points first, then identify the main gaps with clear, actionable guidance.',
-  24
+  0,
+  15
 );

@@ -205,13 +205,12 @@ class TestAuthoringService
     private function sourceFiles(string $testId): array
     {
         return DB::table('test_source_files')->where('test_id', $testId)->orderBy('created_at')
-            ->get(['id', 'test_id', 'original_name', 'mime_type', 'size_bytes', 'storage_key', 'created_at'])
+            ->get(['id', 'test_id', 'original_name', 'mime_type', 'size_bytes', 'created_at'])
             ->map(fn (object $file): array => [
                 'id' => $file->id,
                 'originalName' => $file->original_name,
                 'mimeType' => $file->mime_type,
                 'sizeBytes' => $file->size_bytes,
-                'storageKey' => $file->storage_key,
                 'createdAt' => $file->created_at,
             ])->all();
     }

@@ -15,3 +15,7 @@ web/node_modules/
 web/dist/
 web/.vite/
 *.log
+
+artifacts/
+
+.local-backups/

@@ -33,6 +33,7 @@ import {
   Plus,
   Search,
   Send,
+  Settings,
   ShieldCheck,
   Sparkles,
   Trophy,
@@ -44,13 +45,14 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import {
   API_BASE,
   api,
+  ApiError,
   asArray,
   getToken,
+  getTokenSubject,
   json,
   label,
+  setSessionTokens,
   setToken,
-  subscribeToStudentDataUpdates,
-  type StudentDataUpdate,
 } from "./api";
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -58,6 +60,9 @@ GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 const MAX_ANSWER_PDF_PAGES = 30;
 const MAX_VISION_IMAGE_WIDTH = 1400;
 const MAX_VISION_IMAGE_BYTES = 350 * 1024;
+// Keep status checks light and do not poll faster than the server's suggested
+// interval or the 20-second student-safe minimum.
+const GRADING_FAST_POLLS = 6;
 
 function canvasToJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
@@ -184,7 +189,6 @@ import {
   clearTestAssetCache,
   getTestPageBlob,
   getTestPageCount,
-  setTestAssetCacheRevision,
   setTestAssetCacheUser,
 } from "./test-asset-cache";
 import type { jsPDF } from "jspdf";
@@ -223,6 +227,7 @@ type Page =
   | "academic"
   | "team"
   | "test-admin"
+  | "settings"
   | "access-requests"
   | "students"
   | "users"
@@ -245,6 +250,7 @@ const adminLinks: { id: Page; title: string; icon: typeof LayoutDashboard }[] =
     { id: "academic", title: "Subjects", icon: BookOpen },
     { id: "team", title: "Team Members", icon: Users },
     { id: "test-admin", title: "Tests & Marks", icon: FileText },
+    { id: "settings", title: "Settings", icon: Settings },
     { id: "access-requests", title: "Access Requests", icon: Clock3 },
     { id: "students", title: "Students", icon: Users },
     { id: "users", title: "Users", icon: ShieldCheck },
@@ -1146,20 +1152,30 @@ const pendingResourceRequests = new Map<
   { generation: number; authGeneration: number; promise: Promise<unknown> }
 >();
 const resourceSubscriptions = new Set<ResourceSubscription>();
-const resourceServerStamps = new Map<string, string | null>();
+const resourceFetchedAt = new Map<string, number>();
 const PERSISTED_TEST_CACHE_PREFIX = "nexus.test-cache.v1:";
-const PERSISTED_TEST_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const PERSISTED_TEST_CACHE_MAX_BYTES = 3 * 1024 * 1024;
+// The API has no push channel, so data that changes on the server (attempt status, grading
+// results, leaderboard, support replies) is cached only briefly and then read again.
+const LIVE_RESOURCE_MAX_AGE_MS = 60 * 1000;
 let resourceCacheToken = getToken();
 let resourceAuthGeneration = 0;
 let resourceCacheUserId: string | null = null;
-let currentServerRevisions: StudentDataUpdate | null = null;
 
 function isPersistentTestResource(path: string) {
   return (
     path === "/tests/me/attempts" ||
     /^\/tests\/[^/]+\/me$/.test(path)
   );
+}
+
+function resourceMaxAgeMs(path: string) {
+  return isPersistentTestResource(path) ||
+    /^\/tests\/[^/]+\/me(?:\/|$)/.test(path) ||
+    path === "/leaderboard" ||
+    path === "/student-queries"
+    ? LIVE_RESOURCE_MAX_AGE_MS
+    : Number.POSITIVE_INFINITY;
 }
 
 function persistentTestCacheKey(path: string) {
@@ -1184,35 +1200,26 @@ function readPersistentTestResource<T>(path: string): T | undefined {
       version?: number;
       cachedAt?: number;
       path?: string;
-      serverRevision?: string | null;
       data?: T;
     };
     if (
       entry.version !== 1 ||
       entry.path !== path ||
       typeof entry.cachedAt !== "number" ||
-      Date.now() - entry.cachedAt > PERSISTED_TEST_CACHE_MAX_AGE_MS ||
+      Date.now() - entry.cachedAt > resourceMaxAgeMs(path) ||
       !("data" in entry)
     ) {
       localStorage.removeItem(key);
-      resourceServerStamps.delete(path);
       return undefined;
     }
-    resourceServerStamps.set(
-      path,
-      typeof entry.serverRevision === "string" ? entry.serverRevision : null,
-    );
+    resourceFetchedAt.set(path, entry.cachedAt);
     return entry.data;
   } catch {
     return undefined;
   }
 }
 
-function writePersistentTestResource(
-  path: string,
-  data: unknown,
-  serverRevision: string | null,
-) {
+function writePersistentTestResource(path: string, data: unknown) {
   if (!isPersistentTestResource(path)) return;
   const key = persistentTestCacheKey(path);
   const prefix = persistentTestCachePrefix();
@@ -1222,7 +1229,6 @@ function writePersistentTestResource(
       version: 1,
       cachedAt: Date.now(),
       path,
-      serverRevision,
       data,
     });
     if (serialized.length > PERSISTED_TEST_CACHE_MAX_BYTES) return;
@@ -1282,7 +1288,17 @@ function removePersistentTestResources(
 
 function getCachedResource<T>(path: string): T | undefined {
   ensureResourceCacheScope();
-  if (resourceCache.has(path)) return resourceCache.get(path) as T;
+  if (resourceCache.has(path)) {
+    const fetchedAt = resourceFetchedAt.get(path);
+    if (
+      fetchedAt === undefined ||
+      Date.now() - fetchedAt <= resourceMaxAgeMs(path)
+    ) {
+      return resourceCache.get(path) as T;
+    }
+    resourceCache.delete(path);
+    resourceFetchedAt.delete(path);
+  }
   const persisted = readPersistentTestResource<T>(path);
   if (persisted !== undefined) resourceCache.set(path, persisted);
   return persisted;
@@ -1296,8 +1312,7 @@ function ensureResourceCacheScope() {
     resourceCache.clear();
     resourceGenerations.clear();
     pendingResourceRequests.clear();
-    resourceServerStamps.clear();
-    currentServerRevisions = null;
+    resourceFetchedAt.clear();
   }
 }
 
@@ -1307,8 +1322,7 @@ function setResourceCacheUser(userId: string | null) {
   resourceCache.clear();
   resourceGenerations.clear();
   pendingResourceRequests.clear();
-  resourceServerStamps.clear();
-  currentServerRevisions = null;
+  resourceFetchedAt.clear();
 }
 
 function clearResourceCache() {
@@ -1319,33 +1333,14 @@ function clearResourceCache() {
   resourceCache.clear();
   resourceGenerations.clear();
   pendingResourceRequests.clear();
-  resourceServerStamps.clear();
-  currentServerRevisions = null;
-}
-
-function serverRevisionForPath(path: string) {
-  if (!currentServerRevisions?.instanceId || !currentServerRevisions.revisions) {
-    return null;
-  }
-  const resources =
-    path === "/tests/me/attempts" || /^\/tests\/[^/]+\/me$/.test(path)
-      ? ["my-tests", "dashboard"]
-      : [];
-  if (!resources.length) return null;
-  const versions = resources.map((resource) => {
-    const revision = currentServerRevisions?.revisions?.[resource];
-    return revision
-      ? `${resource}:${revision.global}:${revision.user}`
-      : `${resource}:missing`;
-  });
-  return `${currentServerRevisions.instanceId}|${versions.join("|")}`;
+  resourceFetchedAt.clear();
 }
 
 function invalidateResourcePaths(paths: Iterable<string>) {
   let invalidated = false;
   for (const path of paths) {
     resourceCache.delete(path);
-    resourceServerStamps.delete(path);
+    resourceFetchedAt.delete(path);
     removePersistentTestResources((cachedPath) => cachedPath === path);
     resourceGenerations.set(path, (resourceGenerations.get(path) ?? 0) + 1);
     pendingResourceRequests.delete(path);
@@ -1355,69 +1350,6 @@ function invalidateResourcePaths(paths: Iterable<string>) {
     }
   }
   return invalidated;
-}
-
-function reconcilePersistentTestCache(update: StudentDataUpdate) {
-  const revisions: NonNullable<StudentDataUpdate["revisions"]> = {
-    ...(update.revisions ?? {}),
-  };
-  const knownServerRevisions = currentServerRevisions;
-  const recentRevisions =
-    knownServerRevisions &&
-    knownServerRevisions.instanceId === update.instanceId
-      ? knownServerRevisions.revisions
-      : undefined;
-  if (recentRevisions) {
-    for (const [resource, revision] of Object.entries(recentRevisions)) {
-      const syncedRevision = revisions[resource];
-      revisions[resource] = syncedRevision
-        ? {
-            global: Math.max(syncedRevision.global, revision.global),
-            user: Math.max(syncedRevision.user, revision.user),
-          }
-        : revision;
-    }
-  }
-  currentServerRevisions = { ...update, revisions };
-  setTestAssetCacheRevision(
-    serverRevisionForPath("/tests/me/attempts"),
-  );
-  const prefix = persistentTestCachePrefix();
-  if (!prefix) return false;
-  const stalePaths: string[] = [];
-  try {
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index);
-      if (!key?.startsWith(prefix)) continue;
-      const path = decodeURIComponent(key.slice(prefix.length));
-      if (!isPersistentTestResource(path)) continue;
-      if (!resourceServerStamps.has(path)) {
-        readPersistentTestResource(path);
-      }
-      if (resourceServerStamps.get(path) !== serverRevisionForPath(path)) {
-        stalePaths.push(path);
-      }
-    }
-  } catch {
-    // If browser storage cannot be read, leave cache intact and sync on the next resource request.
-  }
-  return invalidateResourcePaths(stalePaths);
-}
-
-function recordServerResourceRevision(update: StudentDataUpdate) {
-  if (!update.instanceId || !update.revision || update.resource === "sync") {
-    return;
-  }
-  const revisions =
-    currentServerRevisions?.instanceId === update.instanceId
-      ? { ...currentServerRevisions.revisions }
-      : {};
-  revisions[update.resource] = update.revision;
-  currentServerRevisions = {
-    resource: "sync",
-    instanceId: update.instanceId,
-    revisions,
-  };
 }
 
 function loadResource<T>(path: string, force = false): Promise<T> {
@@ -1444,9 +1376,8 @@ function loadResource<T>(path: string, force = false): Promise<T> {
       generation === (resourceGenerations.get(path) ?? 0)
     ) {
       resourceCache.set(path, value);
-      const serverRevision = serverRevisionForPath(path);
-      resourceServerStamps.set(path, serverRevision);
-      writePersistentTestResource(path, value, serverRevision);
+      resourceFetchedAt.set(path, Date.now());
+      writePersistentTestResource(path, value);
     }
     return value;
   });
@@ -1593,63 +1524,6 @@ function App() {
     setToast(s);
     window.setTimeout(() => setToast(""), 3500);
   };
-  useEffect(() => {
-    if (!user || roleIsAdmin(user)) return;
-    const pendingUpdates = new Set<string>();
-    let updateTimer: number | undefined;
-    const flushUpdates = () => {
-      updateTimer = undefined;
-      const updates = Array.from(pendingUpdates);
-      pendingUpdates.clear();
-      const syncUpdate = updates.includes("sync")
-        ? pendingServerSync
-        : null;
-      const syncInvalidated = syncUpdate
-        ? reconcilePersistentTestCache(syncUpdate)
-        : false;
-      const eventInvalidated = invalidateResourceCache(
-        updates.filter((item) => item !== "sync"),
-      );
-      const invalidated = syncInvalidated || eventInvalidated;
-      if (
-        invalidated &&
-        updates.some((resource) => resource !== "sync")
-      ) {
-        setToast("Your latest data has been updated.");
-        window.setTimeout(() => setToast(""), 3500);
-      }
-    };
-    let pendingServerSync: StudentDataUpdate | null = null;
-    const unsubscribe = subscribeToStudentDataUpdates(
-      (update) => {
-        const { resource } = update;
-        if (resource === "keep-alive") return;
-        if (resource === "sync") pendingServerSync = update;
-        else {
-          recordServerResourceRevision(update);
-          if (resource === "my-tests" || resource === "dashboard") {
-            setTestAssetCacheRevision(
-              serverRevisionForPath("/tests/me/attempts"),
-            );
-          }
-        }
-        pendingUpdates.add(resource);
-        if (updateTimer !== undefined) window.clearTimeout(updateTimer);
-        updateTimer = window.setTimeout(flushUpdates, 75);
-      },
-      () => {
-        if (updateTimer !== undefined) window.clearTimeout(updateTimer);
-        clearResourceCache();
-        setToken(null);
-        setUser(null);
-        setAuthError("Your session has expired. Please sign in again.");
-      },
-    );
-    return () => {
-      if (updateTimer !== undefined) window.clearTimeout(updateTimer);
-      unsubscribe();
-    };
-  }, [user]);
   async function signOut() {
     try {
       await api("/auth/signout", { method: "POST" });
@@ -1703,6 +1577,7 @@ function App() {
             academic: ["teacher_assistant"],
             team: [],
             "test-admin": ["teacher_assistant", "testing_manager"],
+            settings: ["admin"],
             students: ["user_manager"],
             users: ["user_manager"],
             passwords: ["password_manager", "user_manager"],
@@ -1874,9 +1749,13 @@ function Login({
         "/auth/login",
         json("POST", { email, password }),
       );
-      if (!result.accessToken)
-        throw new Error("Login response did not include an access token.");
-      setToken(result.accessToken);
+      if (!result.accessToken || !result.refreshToken || !result.user?.id)
+        throw new Error("Login response did not include a complete session.");
+      setSessionTokens(
+        result.accessToken,
+        result.refreshToken,
+        result.user.id,
+      );
       const me = await api<Person>("/auth/me");
       if (adminOnly && !roleIsAdmin(me)) {
         throw new Error(
@@ -1990,6 +1869,8 @@ function PageContent({
       return <Team />;
     case "test-admin":
       return <TestAdmin user={user} notify={notify} />;
+    case "settings":
+      return <TestAdmin user={user} notify={notify} settingsOnly />;
     case "access-requests":
       return <AccessRequests notify={notify} />;
     case "students":
@@ -2375,17 +2256,29 @@ function TestAttempt({
   testId: string;
   onBack: () => void;
 }) {
-  const { data, error, loading, refresh } = useResource<Data>(
+  const { data, error, loading, refresh, setData } = useResource<Data>(
     `/tests/${testId}/me`,
   );
+  const draftKey = `nexus.answer-draft:${getTokenSubject() ?? "unknown"}:${testId}`;
+  const submissionKey = `nexus.submission:${getTokenSubject() ?? "unknown"}:${testId}`;
+  const initialAnswers = (() => {
+    try {
+      const saved = localStorage.getItem(draftKey);
+      const parsed = saved ? JSON.parse(saved) : null;
+      return parsed && typeof parsed === "object" && parsed.answers
+        ? (parsed.answers as Record<number, string>)
+        : {};
+    } catch {
+      return {};
+    }
+  })();
   const [index, setIndex] = useState(0),
-    [answers, setAnswers] = useState<Record<number, string>>({}),
+    [answers, setAnswers] = useState<Record<number, string>>(initialAnswers),
     [questionFiles, setQuestionFiles] = useState<
       Record<number, File | undefined>
     >({}),
     [paperFile, setPaperFile] = useState<File | undefined>(),
     [busy, setBusy] = useState(false),
-    [resubmitting, setResubmitting] = useState(false),
     [gradingQueued, setGradingQueued] = useState(false),
     [gradingPolls, setGradingPolls] = useState(0),
     [message, setMessage] = useState(""),
@@ -2393,6 +2286,13 @@ function TestAttempt({
     [fontSize, setFontSize] = useState("16px"),
     [textAlign, setTextAlign] = useState<"left" | "center" | "right">("left");
   const answerEditor = useRef<HTMLDivElement>(null);
+  const latestAnswers = useRef(answers);
+  latestAnswers.current = answers;
+  const lastSavedDraft = useRef("");
+  const lastDraftSavedAt = useRef(0);
+  const submissionId = useRef<string | null>(
+    localStorage.getItem(submissionKey),
+  );
   const questions = asArray<Data>(data?.questions);
   const question = questions[index];
   const questionKey = Number(question?.questionNumber ?? index + 1);
@@ -2410,42 +2310,158 @@ function TestAttempt({
     }
   }, [questionKey]);
   useEffect(() => {
+    const savedAnswers = asArray<Data>(data?.draftAnswers).reduce<
+      Record<number, string>
+    >((result, answer) => {
+      const number = Number(answer.questionNumber);
+      if (number > 0) result[number] = String(answer.answerText ?? "");
+      return result;
+    }, {});
+    if (Object.keys(savedAnswers).length > 0) {
+      setAnswers((current) =>
+        Object.keys(current).length === 0 ? savedAnswers : current,
+      );
+    }
+  }, [data?.draftAnswers]);
+
+  const saveDraft = (keepalive = false) => {
+    const current = latestAnswers.current;
+    if (Object.keys(current).length === 0) return;
+    const answersJson = JSON.stringify(
+      Object.entries(current).map(([questionNumber, answerText]) => ({
+        questionNumber: Number(questionNumber),
+        answerText,
+      })),
+    );
+    if (
+      answersJson === lastSavedDraft.current ||
+      Date.now() - lastDraftSavedAt.current < 60_000
+    ) {
+      return;
+    }
+    if (keepalive && answersJson.length > 50_000) return;
+    const request = json("PUT", { answers: answersJson });
+    if (keepalive) request.keepalive = true;
+    void api<Data>(`/tests/${testId}/me/draft`, request)
+      .then((result) => {
+        if (result?.saved) {
+          lastSavedDraft.current = answersJson;
+          lastDraftSavedAt.current = Date.now();
+        }
+      })
+      .catch(() => {
+        // The local draft remains available when the server cannot be reached.
+      });
+  };
+  useEffect(() => {
+    if (Object.keys(answers).length === 0) return;
+    try {
+      localStorage.setItem(
+        draftKey,
+        JSON.stringify({ answers, savedAt: new Date().toISOString() }),
+      );
+    } catch {
+      // The form remains usable when storage is disabled or full.
+    }
+    const timer = window.setTimeout(
+      () => saveDraft(),
+      10_000 + Math.round(Math.random() * 5_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [answers, draftKey]);
+  useEffect(() => {
+    const onPageHide = () => saveDraft(true);
+    const timer = window.setInterval(() => saveDraft(), 60_000);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, [testId]);
+  useEffect(() => {
     if (!gradingQueued) return;
     if (
       data?.attempt?.gradingComplete === true ||
       data?.attempt?.status === "COMPLETED"
     ) {
       setGradingQueued(false);
+      refresh();
       setMessage(
         `Your answers were assessed.${data.attempt.resultAvailableAt ? ` Results will be available ${formatDateTime(data.attempt.resultAvailableAt)}.` : ""}`,
       );
       return;
     }
-    if (data?.attempt?.gradingError) {
-      setGradingQueued(false);
-      setMessage(
-        "AI grading could not complete. An administrator can review and retry the saved answers.",
-      );
-      return;
-    }
-    if (gradingPolls >= 60) {
-      setGradingQueued(false);
-      setMessage(
-        "Your answer pages are still being graded. Refresh this page later to check the result.",
-      );
-      return;
-    }
-    const timer = window.setTimeout(() => {
+    let timer: number | undefined;
+    let active = true;
+    const checkStatus = () => {
+      if (!active || document.visibilityState !== "visible") return;
       setGradingPolls((count) => count + 1);
-      refresh();
-    }, 5000);
-    return () => window.clearTimeout(timer);
+      void api<Data>(`/tests/${testId}/me/status`)
+        .then((status) => {
+          if (!active || !status) return;
+          if (status.gradingComplete === true) {
+            setData((current) =>
+              current
+                ? {
+                    ...current,
+                    attempt: {
+                      ...current.attempt,
+                      status: "COMPLETED",
+                      gradingComplete: true,
+                    },
+                  }
+                : current,
+            );
+            return;
+          }
+          setData((current) =>
+            current
+              ? {
+                  ...current,
+                  attempt: {
+                    ...current.attempt,
+                    status: status.status,
+                    gradingComplete: false,
+                    retryAfterSeconds: status.retryAfterSeconds,
+                  },
+                }
+              : current,
+          );
+        })
+        .catch(() => {
+          // A temporary network error does not mean the saved submission failed.
+        });
+    };
+    const schedule = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      if (document.visibilityState !== "visible") return;
+      const base = gradingPolls < GRADING_FAST_POLLS ? 20 : 60;
+      const recommended = Number(data?.attempt?.retryAfterSeconds ?? 20);
+      const jittered = Math.round(
+        Math.max(base, recommended, 20) * (0.8 + Math.random() * 0.4) * 1000,
+      );
+      timer = window.setTimeout(checkStatus, Math.max(20_000, jittered));
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        checkStatus();
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+    schedule();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [
     gradingQueued,
     gradingPolls,
     data?.attempt?.status,
     data?.attempt?.gradingComplete,
-    data?.attempt?.gradingError,
+    data?.attempt?.retryAfterSeconds,
   ]);
   function applyTextFormat(command: "bold" | "italic" | "underline") {
     answerEditor.current?.focus();
@@ -2478,44 +2494,64 @@ function TestAttempt({
           if (file) await appendAnswerFile(form, file, `question-${number}`);
         }
       }
-      const result = await api<Data>(`/tests/${testId}/me/submit`, {
-        method: "POST",
-        body: form,
-      });
+      submissionId.current ??= crypto.randomUUID();
+      localStorage.setItem(submissionKey, submissionId.current);
+      form.append("clientSubmissionId", submissionId.current);
+      let result: Data | undefined;
+      const retryDelays = [1_000, 3_000, 8_000, 15_000];
+      for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+        try {
+          result = await api<Data>(`/tests/${testId}/me/submit`, {
+            method: "POST",
+            body: form,
+          });
+          break;
+        } catch (error) {
+          const retryable =
+            error instanceof ApiError &&
+            [0, 502, 503, 504].includes(error.status);
+          if (!retryable || attempt === retryDelays.length) {
+            if (retryable) {
+              setMessage(
+                "Still sending. Your written answers are saved on this device. Keep this page open and try again shortly.",
+              );
+              return;
+            }
+            throw error;
+          }
+          setMessage(
+            "Still sending. Your written answers are saved on this device.",
+          );
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, retryDelays[attempt]),
+          );
+        }
+      }
+      if (!result) {
+        setMessage(
+          "Still sending. Your written answers are saved on this device. Keep this page open and try again shortly.",
+        );
+        return;
+      }
+      localStorage.removeItem(submissionKey);
+      localStorage.removeItem(draftKey);
+      submissionId.current = null;
+      const queued = Boolean(result.gradingQueued);
       setMessage(
-        result.gradingPending
-          ? String(
-              result.gradingMessage ??
-                "Your answers were saved, but automated grading could not complete. An administrator can review and retry it.",
-            )
+        queued
+          ? `Saved at ${new Date(result.submittedAt ?? Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. Your answers are safe. Your result will appear in My Tests when it has been checked. You can close this page.`
+          : result.gradingPending
+          ? "Your answers are saved. A teacher will check them."
           : `Your answers were saved and assessed.${result.resultAvailableAt ? ` Results will be available ${formatDateTime(result.resultAvailableAt)}.` : ""}`,
       );
-      setGradingQueued(Boolean(result.gradingQueued));
+      setGradingQueued(queued);
       setGradingPolls(0);
+      invalidateResourceCache("my-tests");
       refresh();
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "Submission failed.");
     } finally {
       setBusy(false);
-    }
-  }
-  async function resubmitPreviousAnswers() {
-    const attemptId = String(data?.attempt?.id ?? "");
-    if (!attemptId || resubmitting) return;
-    setResubmitting(true);
-    setMessage("");
-    try {
-      await api(`/tests/${testId}/me/attempts/${attemptId}/resubmit`, {
-        method: "POST",
-      });
-      setMessage(
-        "Your previous submission has been resubmitted for assessment.",
-      );
-      await refresh();
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : "Resubmission failed.");
-    } finally {
-      setResubmitting(false);
     }
   }
   async function requestAccess() {
@@ -2525,6 +2561,7 @@ function TestAttempt({
     try {
       await api(`/tests/${testId}/me/request-access`, { method: "POST" });
       setMessage("Access request sent.");
+      invalidateResourceCache("my-tests");
       await refresh();
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "Request failed.");
@@ -2589,7 +2626,7 @@ function TestAttempt({
       />
       {message && (
         <div
-          className={`alert ${message.includes("submitted") ? "success" : "error"}`}
+          className={`alert ${message.includes("submitted") || gradingQueued ? "success" : "error"}`}
         >
           {message}
         </div>
@@ -2611,31 +2648,14 @@ function TestAttempt({
                 {data?.attempt?.marksObtained != null
                   ? `Result: ${data.attempt.marksObtained} / ${data?.totalMarks ?? "—"} marks`
                   : String(data?.attempt?.status ?? "").toLowerCase() ===
-                      "failed"
-                    ? data?.attempt?.submittedAt
-                      ? "Your submission was saved, but the result could not be prepared. You can resubmit your previous answers below."
-                      : "Your submission could not be saved. Please contact an administrator."
-                    : `Your test has been submitted and is under marking.${data?.attempt?.resultAvailableAt ? ` Results are scheduled for ${formatDateTime(data.attempt.resultAvailableAt)}.` : " The administrator will finish the review."}`}
+                    "failed"
+                  ? "Your answers are saved. A teacher will check them."
+                  : ["submitted", "processing"].includes(
+                        String(data?.attempt?.status ?? "").toLowerCase(),
+                      )
+                    ? "Your answers are safe. Your result will appear in My Tests when it has been checked. You can close this page."
+                      : `Your test has been submitted and is under marking.${data?.attempt?.resultAvailableAt ? ` Results are scheduled for ${formatDateTime(data.attempt.resultAvailableAt)}.` : " The administrator will finish the review."}`}
               </p>
-              {String(data?.attempt?.status ?? "").toLowerCase() === "failed" &&
-                data?.attempt?.submittedAt &&
-                data?.attempt?.id && (
-                  <div className="button-row">
-                    <button
-                      className="button primary"
-                      disabled={resubmitting}
-                      onClick={() => void resubmitPreviousAnswers()}
-                    >
-                      {resubmitting
-                        ? "Resubmitting…"
-                        : "Resubmit previous answers"}
-                    </button>
-                    <span className="muted">
-                      This uses the answers and files from your previous
-                      submission.
-                    </span>
-                  </div>
-                )}
               <div className="button-row result-exports">
                 <button
                   className="button secondary small-button"
@@ -3248,11 +3268,13 @@ function Notebook({
   const sessions = asArray<Data>(sessionData);
   const [question, setQuestion] = useState(""),
     [chatError, setChatError] = useState(""),
+    [chatStatus, setChatStatus] = useState(""),
     [chatBusy, setChatBusy] = useState(false),
     [sessionId, setSessionId] = useState(""),
     [messages, setMessages] = useState<Data[]>([]),
     [notebookView, setNotebookView] = useState<"chat" | "history">("chat"),
     [studyAidMode, setStudyAidMode] = useState(""),
+    [chatImage, setChatImage] = useState<File | null>(null),
     [uploading, setUploading] = useState(false),
     [uploadTitle, setUploadTitle] = useState("");
   const [prompt, setPrompt] = useState(""),
@@ -3269,20 +3291,74 @@ function Notebook({
   }, [promptData]);
   async function chat(e: FormEvent) {
     e.preventDefault();
-    if (!subjectId || !question.trim()) return;
+    if (!subjectId || (!question.trim() && !chatImage)) return;
     setChatBusy(true);
     setChatError("");
+    setChatStatus("");
+    const clientRequestId = window.crypto.randomUUID();
+    const startedAt = Date.now();
+    const statusTimer = window.setTimeout(
+      () => setChatStatus("Still working on it, thank you for your patience."),
+      20_000,
+    );
     try {
       const asked = question.trim();
-      const result = await api<Data>(
-        "/ai-notebook/chat",
-        json("POST", {
+      let firstRequest: RequestInit;
+      if (chatImage) {
+        const form = new FormData();
+        form.append("subjectId", subjectId);
+        form.append("clientRequestId", clientRequestId);
+        form.append("question", asked);
+        form.append("image", chatImage);
+        if (sessionId) form.append("sessionId", sessionId);
+        if (studyAidMode) form.append("studyAidMode", studyAidMode);
+        firstRequest = { method: "POST", body: form };
+      } else {
+        firstRequest = json("POST", {
           subjectId,
+          clientRequestId,
           question: asked,
           ...(sessionId ? { sessionId } : {}),
           ...(studyAidMode ? { studyAidMode } : {}),
-        }),
-      );
+        });
+      }
+      let result: Data;
+      let retries = 0;
+      let ticketAccepted = false;
+      while (true) {
+        try {
+          result = await api<Data>(
+            "/ai-notebook/chat",
+            ticketAccepted
+              ? json("POST", { clientRequestId })
+              : firstRequest,
+          );
+        } catch (ex) {
+          const retryable =
+            ex instanceof ApiError &&
+            (ex.status === 0 || ex.status >= 500);
+          if (!retryable) throw ex;
+          retries += 1;
+          const delay = Math.min(6000, 3000 + (retries % 4) * 1000);
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, delay),
+          );
+          continue;
+        }
+        const retryAfterSeconds = Number(result.retryAfterSeconds);
+        if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+          ticketAccepted = true;
+          retries += 1;
+          const backoff = Math.min(6000, 3000 + (retries % 4) * 1000);
+          const serverDelay = Math.min(6000, retryAfterSeconds * 1000);
+          const delay = Math.max(3000, Math.min(6000, Math.max(backoff, serverDelay)));
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, delay),
+          );
+          continue;
+        }
+        break;
+      }
       const response = firstReadableText(
         result.answer,
         result.response,
@@ -3300,13 +3376,17 @@ function Notebook({
         { role: "assistant", content: response, studyAid: result.studyAid },
       ]);
       setQuestion("");
+      setChatImage(null);
       if (result.sessionId) setSessionId(result.sessionId);
+      setChatStatus("");
       void refreshSessions();
     } catch (ex) {
       setChatError(
         ex instanceof Error ? ex.message : "Could not get a response.",
       );
     } finally {
+      window.clearTimeout(statusTimer);
+      if (Date.now() - startedAt < 20_000) setChatStatus("");
       setChatBusy(false);
     }
   }
@@ -3634,6 +3714,11 @@ function Notebook({
                   </div>
                   <div className="chat-output">
                     {chatError && <ErrorBox error={chatError} />}
+                    {chatStatus && (
+                      <p className="muted" role="status" aria-live="polite">
+                        {chatStatus}
+                      </p>
+                    )}
                     {messages.length ? (
                       messages.map((message, index) => (
                         <div
@@ -3737,6 +3822,7 @@ function Notebook({
                           type="button"
                           className={`study-aid-button ${studyAidMode === option.value ? "selected" : ""}`}
                           aria-pressed={studyAidMode === option.value}
+                          disabled={chatBusy || (!!chatImage && !!option.value)}
                           onClick={() => setStudyAidMode(option.value)}
                         >
                           {option.label}
@@ -3748,14 +3834,41 @@ function Notebook({
                     <textarea
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
-                      placeholder="Ask a question…"
+                      placeholder={chatImage ? "Ask about the attached photo…" : "Ask a question…"}
                       rows={2}
                       maxLength={4000}
+                      disabled={chatBusy}
                     />
+                    <label className="button secondary">
+                      Attach photo
+                      <input
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                        disabled={chatBusy}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0] ?? null;
+                          setChatImage(file);
+                          if (file) setStudyAidMode("");
+                          event.target.value = "";
+                        }}
+                        hidden
+                      />
+                    </label>
+                    {chatImage && (
+                      <button
+                        className="button secondary"
+                        type="button"
+                        disabled={chatBusy}
+                        onClick={() => setChatImage(null)}
+                        aria-label="Remove attached photo"
+                      >
+                        {chatImage.name} ×
+                      </button>
+                    )}
                     <button
                       className="button primary"
-                      disabled={chatBusy || !question.trim()}
-                      aria-label="Send question"
+                      disabled={chatBusy || (!question.trim() && !chatImage)}
+                      aria-label={chatImage ? "Send photo question" : "Send question"}
                     >
                       {chatBusy ? "Thinking…" : <Send size={17} />}
                     </button>
@@ -4128,10 +4241,24 @@ function SubjectSources({
   refreshRef.current = refresh;
   const indexing = sources.some((source) => source.status === "processing");
   useEffect(() => {
-    if (!indexing) return;
-    const timer = window.setInterval(() => refreshRef.current(), 3000);
-    return () => window.clearInterval(timer);
-  }, [indexing]);
+    if (!canManage || !indexing) return;
+    let active = true;
+    let timeout: number | undefined;
+    let attempt = 0;
+    const delays = [5000, 10000, 15000, 30000];
+    const poll = () => {
+      if (!active) return;
+      refreshRef.current();
+      const delay = delays[Math.min(attempt, delays.length - 1)];
+      attempt += 1;
+      timeout = window.setTimeout(poll, delay);
+    };
+    timeout = window.setTimeout(poll, delays[0]);
+    return () => {
+      active = false;
+      if (timeout !== undefined) window.clearTimeout(timeout);
+    };
+  }, [canManage, indexing]);
 
   async function upload(e: FormEvent) {
     e.preventDefault();
@@ -4699,16 +4826,21 @@ function UsersAdmin() {
 }function TestAdmin({
   user,
   notify,
+  settingsOnly = false,
 }: {
   user: Person;
   notify: (s: string) => void;
+  settingsOnly?: boolean;
 }) {
-  const { data, error, loading } = useResource<unknown[]>("/tests");
-  const { data: subjectData } = useResource<unknown[]>("/subjects/list");
+  const { data, error, loading } = useResource<unknown[]>(
+    settingsOnly ? undefined : "/tests",
+  );
+  const { data: subjectData } = useResource<unknown[]>(
+    settingsOnly ? undefined : "/subjects/list",
+  );
   const canManageGradingSettings = Boolean(
     roleIsAdmin(user) &&
-      (user.adminPermissions?.includes("admin") ||
-        user.adminPermissions?.includes("testing_manager")),
+      user.adminPermissions?.includes("admin"),
   );
   const {
     data: gradingSettingsData,
@@ -4722,14 +4854,16 @@ function UsersAdmin() {
     subjects = asArray<Data>(subjectData);
   const [deficiencyReportPrompt, setDeficiencyReportPrompt] = useState("");
   const [resultReleaseDelayHours, setResultReleaseDelayHours] = useState("24");
+  const [notebookDailyQuestionLimit, setNotebookDailyQuestionLimit] =
+    useState("15");
   const [savingReportPrompt, setSavingReportPrompt] = useState(false);
   const [reportPromptMessage, setReportPromptMessage] = useState("");
   const [sourceFileBusy, setSourceFileBusy] = useState("");
   const [selected, setSelected] = useState(""),
-    [activeTab, setActiveTab] = useState<"tests" | "settings">("tests"),
     [showCreate, setShowCreate] = useState(false),
     [showPreview, setShowPreview] = useState(false),
     [subjectId, setSubjectId] = useState("");
+  const activeTab = settingsOnly ? "settings" : "tests";
   useEffect(() => {
     if (gradingSettingsData) {
       setDeficiencyReportPrompt(
@@ -4737,6 +4871,9 @@ function UsersAdmin() {
       );
       setResultReleaseDelayHours(
         String(gradingSettingsData.resultReleaseDelayHours ?? 24),
+      );
+      setNotebookDailyQuestionLimit(
+        String(gradingSettingsData.notebookDailyQuestionLimit ?? 15),
       );
     }
   }, [gradingSettingsData]);
@@ -4750,15 +4887,16 @@ function UsersAdmin() {
         json("PUT", {
           deficiencyReportPrompt,
           resultReleaseDelayHours: Number(resultReleaseDelayHours),
+          notebookDailyQuestionLimit: Number(notebookDailyQuestionLimit),
         }),
       );
-      setReportPromptMessage("Grading settings saved.");
+      setReportPromptMessage("Application settings saved.");
       refreshGradingSettings();
     } catch (ex) {
       setReportPromptMessage(
         ex instanceof Error
           ? ex.message
-          : "Could not save the deficiency report prompt.",
+          : "Could not save application settings.",
       );
     } finally {
       setSavingReportPrompt(false);
@@ -4805,10 +4943,12 @@ function UsersAdmin() {
   return (
     <>
       <Heading
-        eyebrow="ASSESSMENTS"
-        title="Tests & Marks"
-        description="Browse tests by subject, review attempts, and update marks."
-        action={activeTab === "tests" ? (
+        eyebrow={settingsOnly ? "ADMINISTRATION" : "ASSESSMENTS"}
+        title={settingsOnly ? "Application Settings" : "Tests & Marks"}
+        description={settingsOnly
+          ? "Manage shared application behavior and grading settings."
+          : "Browse tests by subject, review attempts, and update marks."}
+        action={!settingsOnly && activeTab === "tests" ? (
           <div className="button-row">
             <button
               className="button secondary"
@@ -4825,36 +4965,13 @@ function UsersAdmin() {
           </div>
         ) : undefined}
       />
-      <div className="admin-tabs" role="tablist" aria-label="Tests and settings">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === "tests"}
-          className={activeTab === "tests" ? "active" : ""}
-          onClick={() => setActiveTab("tests")}
-        >
-          Tests & review
-        </button>
-        {canManageGradingSettings && (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "settings"}
-            className={activeTab === "settings" ? "active" : ""}
-            onClick={() => setActiveTab("settings")}
-          >
-            Settings
-          </button>
-        )}
-      </div>
       {activeTab === "settings" && canManageGradingSettings ? (
       <Card className="grading-prompt-card">
         <div className="card-heading">
           <div>
-            <h2>AI deficiency report prompt</h2>
+            <h2>Application settings</h2>
             <p>
-              Set the style and guidance the AI should follow when writing
-              overall and per-question feedback.
+              Configure the student AI Notebook limit and test result release.
             </p>
           </div>
           <Sparkles size={18} />
@@ -4866,8 +4983,29 @@ function UsersAdmin() {
             className="form-stack compact-form"
             onSubmit={saveDeficiencyReportPrompt}
           >
+            <label htmlFor="notebook-daily-question-limit">
+              AI Notebook questions per student per day
+              <input
+                id="notebook-daily-question-limit"
+                type="number"
+                min="1"
+                max="1000"
+                step="1"
+                required
+                value={notebookDailyQuestionLimit}
+                onChange={(event) =>
+                  setNotebookDailyQuestionLimit(event.target.value)
+                }
+                disabled={gradingSettingsLoading || savingReportPrompt}
+                aria-describedby="notebook-daily-question-limit-help"
+              />
+              <small id="notebook-daily-question-limit-help">
+                Default is 15. Failed answers are not counted. The daily
+                allowance resets at midnight Asia/Karachi time.
+              </small>
+            </label>
             <label htmlFor="ai-deficiency-report-prompt">
-              Report instructions
+              AI deficiency report instructions
               <textarea
                 id="ai-deficiency-report-prompt"
                 value={deficiencyReportPrompt}
@@ -4924,7 +5062,7 @@ function UsersAdmin() {
                 className="button primary"
                 disabled={gradingSettingsLoading || savingReportPrompt}
               >
-                {savingReportPrompt ? "Saving…" : "Save grading settings"}
+                {savingReportPrompt ? "Saving…" : "Save settings"}
               </button>
               <button
                 className="button secondary"

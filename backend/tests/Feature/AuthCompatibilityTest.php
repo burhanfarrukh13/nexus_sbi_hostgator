@@ -98,4 +98,85 @@ class AuthCompatibilityTest extends TestCase
         ])->assertBadRequest()
             ->assertJsonStructure(['statusCode', 'message', 'error']);
     }
+
+    public function test_login_limiter_allows_different_emails_from_one_shared_ip(): void
+    {
+        for ($index = 1; $index <= 20; $index++) {
+            $this->postJson('/api/auth/login', [
+                'email' => "student{$index}@example.test",
+                'password' => 'not-the-password',
+            ])->assertUnauthorized();
+        }
+    }
+
+    public function test_login_limiter_blocks_sixth_attempt_for_same_email_and_ip(): void
+    {
+        for ($index = 1; $index <= 5; $index++) {
+            $this->postJson('/api/auth/login', [
+                'email' => 'target@example.test',
+                'password' => 'not-the-password',
+            ])->assertUnauthorized();
+        }
+
+        $this->postJson('/api/auth/login', [
+            'email' => 'target@example.test',
+            'password' => 'not-the-password',
+        ])->assertTooManyRequests()
+            ->assertHeader('Retry-After')
+            ->assertJsonStructure(['statusCode', 'message', 'error']);
+    }
+
+    public function test_refresh_limiter_is_per_user_and_returns_retry_after(): void
+    {
+        $userIds = [];
+        for ($index = 1; $index <= 11; $index++) {
+            $userId = (string) Str::uuid();
+            $userIds[] = $userId;
+            $this->postJson('/api/auth/refresh', [
+                'userId' => $userId,
+                'refreshToken' => str_repeat('x', 32),
+            ])->assertUnauthorized();
+        }
+
+        $limitedUserId = $userIds[0];
+        for ($index = 0; $index < 9; $index++) {
+            $this->postJson('/api/auth/refresh', [
+                'userId' => $limitedUserId,
+                'refreshToken' => str_repeat('x', 32),
+            ])->assertUnauthorized();
+        }
+
+        $this->postJson('/api/auth/refresh', [
+            'userId' => $limitedUserId,
+            'refreshToken' => str_repeat('x', 32),
+        ])->assertTooManyRequests()->assertHeader('Retry-After');
+    }
+
+    public function test_authenticated_api_budget_is_per_user_and_returns_retry_after(): void
+    {
+        $id = (string) Str::uuid();
+        DB::table('users')->insert([
+            'id' => $id,
+            'email' => 'reader@example.test',
+            'password' => Hash::make('correct-horse-battery'),
+            'role' => 'student',
+            'refreshCounter' => 0,
+            'must_reset_password' => false,
+            'createdAt' => now(),
+            'updatedAt' => now(),
+        ]);
+        $token = $this->postJson('/api/auth/login', [
+            'email' => 'reader@example.test',
+            'password' => 'correct-horse-battery',
+        ])->assertCreated()->json('accessToken');
+
+        for ($index = 0; $index < 120; $index++) {
+            $this->withToken($token)->getJson('/api/leaderboard')->assertOk();
+        }
+
+        $this->withToken($token)->getJson('/api/leaderboard')
+            ->assertTooManyRequests()
+            ->assertHeader('Retry-After')
+            ->assertJsonStructure(['statusCode', 'message', 'error']);
+    }
 }
