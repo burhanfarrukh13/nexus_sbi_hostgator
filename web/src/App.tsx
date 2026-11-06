@@ -2509,11 +2509,14 @@ function TestAttempt({
         } catch (error) {
           const retryable =
             error instanceof ApiError &&
-            [0, 502, 503, 504].includes(error.status);
+            [0, 429, 502, 503, 504, 508].includes(error.status);
           if (!retryable || attempt === retryDelays.length) {
             if (retryable) {
+              const isLimit = error instanceof ApiError && (error.status === 508 || error.status === 429);
               setMessage(
-                "Still sending. Your written answers are saved on this device. Keep this page open and try again shortly.",
+                isLimit
+                  ? "The server is temporarily busy (Resource Limit reached). All your answers and uploaded files remain safely saved on your device. Please wait 1 to 2 minutes, then click Submit again."
+                  : "Still sending. Your written answers and files are saved on this device. Keep this page open and try again shortly.",
               );
               return;
             }
@@ -2549,7 +2552,16 @@ function TestAttempt({
       invalidateResourceCache("my-tests");
       refresh();
     } catch (e) {
-      setMessage(e instanceof Error ? e.message : "Submission failed.");
+      if (
+        (e instanceof ApiError && (e.status === 508 || e.status === 429)) ||
+        (e instanceof Error && /508|resource limit/i.test(e.message))
+      ) {
+        setMessage(
+          "The server is temporarily busy (Resource Limit reached). All your answers and uploaded files remain safely saved on your device. Please wait 1 to 2 minutes, then click Submit again.",
+        );
+      } else {
+        setMessage(e instanceof Error ? e.message : "Submission failed.");
+      }
     } finally {
       setBusy(false);
     }
@@ -3322,10 +3334,42 @@ function Notebook({
           ...(studyAidMode ? { studyAidMode } : {}),
         });
       }
-      let result: Data;
-      let retries = 0;
-      let ticketAccepted = false;
-      while (true) {
+      let result: Data | undefined;
+      const aiWorkerUrl = (import.meta.env.VITE_AI_WORKER_URL || "").replace(/\/$/, "");
+      if (aiWorkerUrl && !chatImage) {
+        try {
+          const workerRes = await fetch(`${aiWorkerUrl}/chat`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${getToken()}`,
+            },
+            body: JSON.stringify({
+              subjectId,
+              question: asked,
+              ...(sessionId ? { sessionId } : {}),
+              ...(studyAidMode ? { studyAidMode } : {}),
+            }),
+          });
+          if (workerRes.ok) {
+            result = (await workerRes.json()) as Data;
+          } else {
+            const errData = (await workerRes.json().catch(() => ({}))) as Record<string, unknown>;
+            if (workerRes.status === 401 || workerRes.status === 403 || workerRes.status === 429) {
+              throw new Error(String(errData.message || `Request failed (${workerRes.status})`));
+            }
+          }
+        } catch (workerErr) {
+          if (workerErr instanceof Error && /authentication|permission|quota|limit/i.test(workerErr.message)) {
+            throw workerErr;
+          }
+        }
+      }
+
+      if (!result) {
+        let retries = 0;
+        let ticketAccepted = false;
+        while (true) {
         try {
           result = await api<Data>(
             "/ai-notebook/chat",
@@ -3358,6 +3402,10 @@ function Notebook({
           continue;
         }
         break;
+      }
+      }
+      if (!result) {
+        throw new Error("Could not get a response from the notebook.");
       }
       const response = firstReadableText(
         result.answer,

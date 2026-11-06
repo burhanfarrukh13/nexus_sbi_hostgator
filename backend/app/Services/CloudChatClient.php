@@ -14,6 +14,7 @@ class CloudChatClient
         $key = (string) config('services.ai_chat.key');
         $model = (string) config('services.ai_chat.model');
         $timeout = min(300, max(3, $timeoutOverride ?? (int) config('services.ai_chat.timeout', 300)));
+        $connectTimeout = min(30, max(2, (int) config('services.ai_chat.connect_timeout', 15)));
         if (!str_starts_with($url, 'https://') || $key === '' || $model === '') {
             throw new RuntimeException('Ollama Cloud is not configured. Set OLLAMA_API_URL, OLLAMA_API_KEY, and OLLAMA_MODEL.');
         }
@@ -37,6 +38,7 @@ class CloudChatClient
             try {
                 $response = Http::acceptJson()
                     ->withToken($key)
+                    ->connectTimeout($connectTimeout)
                     ->timeout($timeout)
                     ->post($url, $payload);
             } catch (Throwable) {

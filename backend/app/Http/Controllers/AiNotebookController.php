@@ -250,6 +250,160 @@ class AiNotebookController
         )->all());
     }
 
+    public function context(Request $request): JsonResponse
+    {
+        $input = $request->validate([
+            'subjectId' => ['required', 'uuid'],
+            'question' => ['required', 'string', 'max:4000'],
+            'sessionId' => ['sometimes', 'nullable', 'uuid'],
+            'studyAidMode' => ['sometimes', 'nullable', 'in:summary,mind_map'],
+        ]);
+        $identity = $this->identity($request);
+        $userId = (string) $identity['userId'];
+        $subjectId = (string) $input['subjectId'];
+        $this->ensureSubjectAccessible($request, $subjectId);
+
+        $usage = ($identity['role'] ?? null) === 'student'
+            ? $this->reserveUsage($userId)
+            : null;
+
+        $sessionId = $input['sessionId'] ?? null;
+        $session = $sessionId === null
+            ? null
+            : DB::table('ai_notebook_chat_sessions')
+                ->where('id', $sessionId)
+                ->where('user_id', $userId)
+                ->where('subject_id', $subjectId)
+                ->first();
+        if ($sessionId !== null && !$session) {
+            $sessionId = null;
+        }
+
+        $userQuestion = trim((string) $input['question']);
+        $retrieved = $this->retrieveChunks($subjectId, $userQuestion);
+        $subject = DB::table('subjects')->where('id', $subjectId)->first();
+        $defaultPrompt = DB::table('ai_notebook_prompts')->where('subject_id', $subjectId)->first();
+        $personalPrompt = DB::table('ai_notebook_user_prompts')
+            ->where('subject_id', $subjectId)
+            ->where('user_id', $userId)
+            ->first();
+        $prompt = $personalPrompt?->prompt ?: ($defaultPrompt?->prompt ?? '');
+        $language = $personalPrompt?->response_language
+            ?? $defaultPrompt?->response_language
+            ?? 'english';
+        $instructions = trim(
+            'You are a subject-specific learning assistant for '.($subject->name ?? 'the selected subject').'. '.
+            'Answer accurately using the supplied source excerpts. If they do not contain the answer, say so plainly. '.
+            'Do not invent citations. Respond in '.str_replace('_', ' ', $language).'. '.
+            $prompt
+        );
+        if (($input['studyAidMode'] ?? null) === 'summary') {
+            $instructions .= ' Create a concise, well-organized study summary using only source excerpts, with a main idea, key concepts, and short recap.';
+        } elseif (($input['studyAidMode'] ?? null) === 'mind_map') {
+            $instructions .= ' Create a visual study mind map using only source excerpts. Return raw JSON only with exactly {"title":"short topic title","branches":[{"label":"main idea","children":[{"label":"supporting idea","children":[]}]}]}. Each node has a concise string label and children array. Use 2-12 top-level branches, up to 8 children per node, and no more than 96 nodes. Do not invent unsupported facts.';
+        }
+
+        $context = implode("\n\n", array_map(
+            static fn (array $item): string => '[Source: '.$item['title'].', chunk '.($item['ordinal'] + 1)."]\n".$item['content'],
+            $retrieved
+        ));
+        if ($context === '') {
+            $context = 'No indexed source excerpt matched the question. Tell the user the subject sources do not currently contain a relevant passage.';
+        }
+
+        $history = $session === null
+            ? []
+            : DB::table('ai_notebook_chat_messages')
+                ->where('session_id', $sessionId)
+                ->orderByDesc('created_at')
+                ->limit(12)
+                ->get(['role', 'content'])
+                ->reverse()
+                ->map(static fn (object $message): array => [
+                    'role' => $message->role,
+                    'content' => preg_replace('/\s*<!--nexus-study-aid:[A-Za-z0-9+\/=]+-->/', '', $message->content) ?? $message->content,
+                ])->all();
+
+        $citations = array_map(static fn (array $item): array => [
+            'sourceId' => $item['sourceId'],
+            'title' => $item['title'],
+            'chunk' => $item['ordinal'] + 1,
+        ], $retrieved);
+
+        return response()->json([
+            'instructions' => $instructions,
+            'sourceContext' => $context,
+            'history' => $history,
+            'sessionId' => $sessionId ?? (string) Str::uuid(),
+            'citations' => $citations,
+            'model' => config('services.ai_chat.model'),
+            'usageDate' => $usage['date'] ?? null,
+        ]);
+    }
+
+    public function recordMessage(Request $request): JsonResponse
+    {
+        $input = $request->validate([
+            'subjectId' => ['required', 'uuid'],
+            'sessionId' => ['required', 'uuid'],
+            'userQuestion' => ['required', 'string'],
+            'answer' => ['required', 'string'],
+            'citations' => ['sometimes', 'array'],
+            'studyAid' => ['sometimes', 'nullable', 'array'],
+        ]);
+        $identity = $this->identity($request);
+        $userId = (string) $identity['userId'];
+        $subjectId = (string) $input['subjectId'];
+        $sessionId = (string) $input['sessionId'];
+        $userQuestion = (string) $input['userQuestion'];
+        $answer = (string) $input['answer'];
+        $storedAnswer = $answer;
+        if (($input['studyAid']['type'] ?? null) === 'mind_map') {
+            $storedAnswer .= "\n\n<!--nexus-study-aid:".base64_encode(json_encode($input['studyAid'], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE)).'-->';
+        }
+
+        $now = now();
+        DB::transaction(function () use ($sessionId, $subjectId, $userId, $userQuestion, $storedAnswer, $now): void {
+            $session = DB::table('ai_notebook_chat_sessions')
+                ->where('id', $sessionId)
+                ->where('user_id', $userId)
+                ->first();
+            if ($session === null) {
+                DB::table('ai_notebook_chat_sessions')->insert([
+                    'id' => $sessionId,
+                    'subject_id' => $subjectId,
+                    'user_id' => $userId,
+                    'title' => Str::limit($userQuestion, 120, ''),
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            } else {
+                DB::table('ai_notebook_chat_sessions')->where('id', $sessionId)->update([
+                    'updated_at' => $now,
+                ]);
+            }
+
+            DB::table('ai_notebook_chat_messages')->insert([
+                [
+                    'id' => (string) Str::uuid(),
+                    'session_id' => $sessionId,
+                    'role' => 'user',
+                    'content' => $userQuestion,
+                    'created_at' => $now,
+                ],
+                [
+                    'id' => (string) Str::uuid(),
+                    'session_id' => $sessionId,
+                    'role' => 'assistant',
+                    'content' => $storedAnswer,
+                    'created_at' => $now,
+                ],
+            ]);
+        });
+
+        return response()->json(['saved' => true]);
+    }
+
     public function chat(Request $request): JsonResponse
     {
         $input = $request->validate([

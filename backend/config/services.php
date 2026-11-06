@@ -14,6 +14,7 @@ return [
         'model' => env('OLLAMA_MODEL'),
         'timeout' => (int) env('OLLAMA_TIMEOUT_SECONDS', 300),
         'notebook_timeout' => (int) env('OLLAMA_CHAT_TIMEOUT_SECONDS', 60),
+        'connect_timeout' => (int) env('OLLAMA_CONNECT_TIMEOUT_SECONDS', 15),
         'retry_delays' => [1, 3, 8],
     ],
     'ai_notebook' => [

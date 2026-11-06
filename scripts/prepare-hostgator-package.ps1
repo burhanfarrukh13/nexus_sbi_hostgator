@@ -30,7 +30,9 @@ param(
     # Pass --ignore-platform-reqs to composer (only if THIS machine lacks PHP extensions that HostGator has).
     [switch]$IgnorePlatformReqs,
     # Reuse web\dist instead of rebuilding (it must already be built for -ApiUrl).
-    [switch]$SkipWebBuild
+    [switch]$SkipWebBuild,
+    # Optional Cloudflare Worker URL for Zero Server Load AI Notebook chat
+    [string]$AiWorkerUrl = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -246,11 +248,13 @@ if (-not $SkipWebBuild) {
         if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
         # A process environment variable overrides any VITE_API_BASE_URL in a .env file.
         $env:VITE_API_BASE_URL = $ApiUrl
+        if ($AiWorkerUrl) { $env:VITE_AI_WORKER_URL = $AiWorkerUrl.Trim().TrimEnd('/') }
         npm run build
         if ($LASTEXITCODE -ne 0) { throw 'npm run build failed.' }
     }
     finally {
         Remove-Item Env:\VITE_API_BASE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\VITE_AI_WORKER_URL -ErrorAction SilentlyContinue
         Pop-Location
     }
 }
@@ -287,7 +291,8 @@ if (-not (Test-Path -LiteralPath $webHtaccess)) {
 }
 $htaccessText = [System.IO.File]::ReadAllText($webHtaccess)
 # Narrow the Content-Security-Policy to the API origin this build talks to.
-$narrowed = $htaccessText.Replace("connect-src 'self' https:", "connect-src 'self' $ApiUrl")
+$allowedConnect = if ($AiWorkerUrl) { "connect-src 'self' $ApiUrl $AiWorkerUrl" } else { "connect-src 'self' $ApiUrl" }
+$narrowed = $htaccessText.Replace("connect-src 'self' https:", $allowedConnect)
 if ($narrowed -eq $htaccessText) {
     Write-Warning 'Could not narrow connect-src in .htaccess; it keeps the generic https: rule.'
 }

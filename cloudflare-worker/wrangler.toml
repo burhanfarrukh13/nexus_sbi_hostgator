@@ -1,0 +1,14 @@
+name = "nexus-ai-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[vars]
+# Replace with your HostGator Laravel API domain (no trailing slash)
+LARAVEL_API_URL = "https://api.yourdomain.com"
+
+# Ollama Cloud configuration
+OLLAMA_API_URL = "https://ollama.com/v1/chat/completions"
+OLLAMA_MODEL = "gemma4:31b"
+
+# Secret (Set using `npx wrangler secret put OLLAMA_API_KEY` or in Cloudflare Dashboard Variables)
+# OLLAMA_API_KEY = "your_ollama_key_here"

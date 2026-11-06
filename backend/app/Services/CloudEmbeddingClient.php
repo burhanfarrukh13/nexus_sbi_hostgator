@@ -24,6 +24,7 @@ class CloudEmbeddingClient
         $model = (string) config('services.embeddings.model');
         $dimensions = (int) config('services.embeddings.dimensions');
         $timeout = min(60, max(3, (int) config('services.embeddings.timeout', 30)));
+        $connectTimeout = min(30, max(2, (int) config('services.embeddings.connect_timeout', 15)));
         if (!str_starts_with($url, 'https://') || $key === '' || $model === '' || $dimensions < 1) {
             throw new RuntimeException('OpenRouter embeddings are not fully configured.');
         }
@@ -31,6 +32,7 @@ class CloudEmbeddingClient
         try {
             $response = Http::acceptJson()
                 ->withToken($key)
+                ->connectTimeout($connectTimeout)
                 ->timeout($timeout)
                 ->post($url, [
                     'model' => $model,

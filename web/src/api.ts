@@ -270,7 +270,10 @@ export async function api<T = unknown>(
       } catch {
         /* non-JSON error */
       }
-      if (/\bAI\b|Ollama|\bmodels?\b/i.test(message)) {
+      if (response.status === 508) {
+        message =
+          "The server is temporarily busy (Resource Limit Reached). Your answers remain safely saved on your device. Please wait 1 to 2 minutes and try again.";
+      } else if (/\bAI\b|Ollama|\bmodels?\b/i.test(message)) {
         message =
           "This feature is temporarily unavailable. Please try again or contact an administrator.";
       }

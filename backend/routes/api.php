@@ -84,6 +84,8 @@ Route::middleware(['auth.compat', 'throttle:authenticated-api'])->prefix('ai-not
     Route::delete('/sources/{id}', [AiNotebookController::class, 'deleteSource'])
         ->middleware('permission.compat:admin|teacher_assistant');
     Route::get('/sessions', [AiNotebookController::class, 'sessions']);
+    Route::post('/context', [AiNotebookController::class, 'context']);
+    Route::post('/record-message', [AiNotebookController::class, 'recordMessage']);
     Route::post('/chat', [AiNotebookController::class, 'chat'])->middleware('throttle:notebook-chat');
     Route::get('/sessions/{id}', [AiNotebookController::class, 'session']);
     Route::delete('/sessions/{id}', [AiNotebookController::class, 'deleteSession']);

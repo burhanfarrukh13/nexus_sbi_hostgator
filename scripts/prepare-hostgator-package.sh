@@ -134,7 +134,12 @@ HTACCESS="$WEB_STAGE/.htaccess"
 # Narrow the Content-Security-Policy to the API origin this build talks to.
 if grep -qF "connect-src 'self' https:" "$HTACCESS"; then
   ESCAPED_URL="$(printf '%s' "$API_URL" | sed -e 's/[&|\\]/\\&/g')"
-  sed -i.bak "s|connect-src 'self' https:|connect-src 'self' $ESCAPED_URL|" "$HTACCESS"
+  if [ -n "${AI_WORKER_URL:-}" ]; then
+    ESCAPED_WORKER="$(printf '%s' "$AI_WORKER_URL" | sed -e 's/[&|\\]/\\&/g')"
+    sed -i.bak "s|connect-src 'self' https:|connect-src 'self' $ESCAPED_URL $ESCAPED_WORKER|" "$HTACCESS"
+  else
+    sed -i.bak "s|connect-src 'self' https:|connect-src 'self' $ESCAPED_URL|" "$HTACCESS"
+  fi
   rm -f "$HTACCESS.bak"
 else
   echo "Warning: could not narrow connect-src in .htaccess; it keeps the generic https: rule." >&2
