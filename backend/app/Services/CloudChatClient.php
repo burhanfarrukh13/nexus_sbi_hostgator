@@ -8,7 +8,12 @@ use Throwable;
 
 class CloudChatClient
 {
-    public function complete(array $messages, bool $jsonResponse = false, ?int $timeoutOverride = null): string
+    public function complete(
+        array $messages,
+        bool $jsonResponse = false,
+        ?int $timeoutOverride = null,
+        ?int $maxTokens = null
+    ): string
     {
         $url = (string) config('services.ai_chat.url');
         $key = (string) config('services.ai_chat.key');
@@ -29,6 +34,9 @@ class CloudChatClient
         ];
         if ($jsonResponse) {
             $payload['response_format'] = ['type' => 'json_object'];
+        }
+        if ($maxTokens !== null) {
+            $payload['max_tokens'] = max(1, min(8192, $maxTokens));
         }
 
         $response = null;

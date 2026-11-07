@@ -29,7 +29,12 @@ class AiNotebookDailyLimitTest extends TestCase
         $this->chatClient = new class extends CloudChatClient {
             public bool $shouldFail = false;
 
-            public function complete(array $messages, bool $jsonResponse = false, ?int $timeoutOverride = null): string
+            public function complete(
+                array $messages,
+                bool $jsonResponse = false,
+                ?int $timeoutOverride = null,
+                ?int $maxTokens = null
+            ): string
             {
                 if ($this->shouldFail) {
                     throw new RuntimeException('provider unavailable');

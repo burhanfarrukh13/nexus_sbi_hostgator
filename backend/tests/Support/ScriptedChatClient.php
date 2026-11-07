@@ -25,7 +25,12 @@ final class ScriptedChatClient extends CloudChatClient
         return new self(static fn (): array|string => $response);
     }
 
-    public function complete(array $messages, bool $jsonResponse = false, ?int $timeoutOverride = null): string
+    public function complete(
+        array $messages,
+        bool $jsonResponse = false,
+        ?int $timeoutOverride = null,
+        ?int $maxTokens = null
+    ): string
     {
         $number = count($this->calls);
         $this->calls[] = $messages;

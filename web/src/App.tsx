@@ -172,18 +172,24 @@ async function appendAnswerFile(
   prefix: string,
 ): Promise<void> {
   if (file.name.toLowerCase().endsWith(".pdf")) {
+    if (prefix === "paper") {
+      const safeName =
+        file.name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^\.+/, "").slice(0, 180) ||
+        "submission.pdf";
+      form.append("files[]", file, `paper-source-${safeName}`);
+    }
     for (const page of await renderAnswerPdf(file, prefix)) {
-      form.append("files", page, page.name);
+      form.append("files[]", page, page.name);
     }
     return;
   }
   if (file.type.startsWith("image/")) {
     const image = await compactAnswerImage(file, prefix);
-    form.append("files", image, image.name);
+    form.append("files[]", image, image.name);
     return;
   }
   const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
-  form.append("files", file, `${prefix}.${extension}`);
+  form.append("files[]", file, `${prefix}.${extension}`);
 }
 import {
   clearTestAssetCache,
@@ -297,11 +303,197 @@ const formatDateTime = (x: unknown) => {
 function splitMarkdownTableRow(line: string): string[] | null {
   const trimmed = line.trim();
   if (!trimmed.includes("|")) return null;
-  return trimmed
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.replace(/\\\|/g, "|").trim());
+  const cells: string[] = [];
+  let cell = "";
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    if (character === "\\" && trimmed[index + 1] === "|") {
+      cell += "|";
+      index += 1;
+    } else if (character === "|") {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim());
+  if (trimmed.startsWith("|")) cells.shift();
+  if (trimmed.endsWith("|") && cells[cells.length - 1] === "") cells.pop();
+  return cells;
+}
+
+function tableCellForMarkdown(value: string): string {
+  return value.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+}
+
+function questionTextForPdf(content: string): string {
+  let normalized = content;
+  if (/&lt;\s*table\b/i.test(normalized)) {
+    normalized =
+      new DOMParser().parseFromString(normalized, "text/html").documentElement
+        .textContent ?? normalized;
+  }
+  if (/<table\b/i.test(normalized)) {
+    const parsed = new DOMParser().parseFromString(normalized, "text/html");
+    parsed.querySelectorAll("script, style").forEach((node) => node.remove());
+    parsed.querySelectorAll("table").forEach((table) => {
+      const rows = Array.from(table.querySelectorAll("tr"))
+        .map((row) =>
+          Array.from(row.querySelectorAll("th, td")).map((cell) =>
+            tableCellForMarkdown(cell.textContent ?? ""),
+          ),
+        )
+        .filter((row) => row.some(Boolean));
+      const columnCount = Math.max(0, ...rows.map((row) => row.length));
+      if (!columnCount) {
+        table.remove();
+        return;
+      }
+      const paddedRows = rows.map((row) =>
+        Array.from({ length: columnCount }, (_, index) => row[index] ?? ""),
+      );
+      const markdown = [
+        `| ${paddedRows[0].join(" | ")} |`,
+        `| ${paddedRows[0].map(() => "---").join(" | ")} |`,
+        ...paddedRows.slice(1).map((row) => `| ${row.join(" | ")} |`),
+      ].join("\n");
+      table.replaceWith(parsed.createTextNode(`\n${markdown}\n`));
+    });
+
+    const extractText = (node: Node): string => {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+      const tagName = node instanceof Element ? node.tagName : "";
+      if (tagName === "BR") return "\n";
+      const text = Array.from(node.childNodes, extractText).join("");
+      return /^(P|DIV|LI|H[1-6]|TR|SECTION|ARTICLE)$/.test(tagName)
+        ? `\n${text}\n`
+        : text;
+    };
+    normalized = extractText(parsed.body).replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  const lines = normalizeJournalTables(normalized.replace(/\r\n?/g, "\n").split("\n"));
+  const output: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const firstRow =
+      splitTabDelimitedRow(lines[index]) ??
+      splitAlignedTableRow(lines[index]) ??
+      splitFinancialTableRow(lines[index]);
+    if (!firstRow) {
+      output.push(lines[index]);
+      continue;
+    }
+    const rows = [firstRow];
+    let nextIndex = index + 1;
+    while (nextIndex < lines.length) {
+      const row =
+        splitTabDelimitedRow(lines[nextIndex]) ??
+        splitAlignedTableRow(lines[nextIndex]) ??
+        splitFinancialTableRow(lines[nextIndex]);
+      if (!row) break;
+      rows.push(row);
+      nextIndex += 1;
+    }
+    const dataRows = rows.filter(
+      (row) => !row.every((cell) => /^:?-{3,}:?$/.test(cell)),
+    );
+    if (dataRows.length < 2) {
+      output.push(lines[index]);
+      continue;
+    }
+    const columnCount = Math.max(...dataRows.map((row) => row.length));
+    const paddedRows = dataRows.map((row) =>
+      Array.from({ length: columnCount }, (_, cellIndex) => row[cellIndex] ?? ""),
+    );
+    output.push(
+      `| ${paddedRows[0].map(tableCellForMarkdown).join(" | ")} |`,
+      `| ${paddedRows[0].map(() => "---").join(" | ")} |`,
+      ...paddedRows
+        .slice(1)
+        .map((row) => `| ${row.map(tableCellForMarkdown).join(" | ")} |`),
+    );
+    index = nextIndex - 1;
+  }
+  return output.join("\n");
+}
+
+function splitAlignedTableRow(line: string): string[] | null {
+  if (!/\S {2,}\S/.test(line)) return null;
+  const cells = line.trim().split(/ {2,}/).map((cell) => cell.trim());
+  return cells.length >= 2 && cells.length <= 12 ? cells : null;
+}
+
+function splitFinancialTableRow(line: string): string[] | null {
+  const cell = String.raw`(?:\(?-?\d[\d,]*(?:\.\d+)?\)?|[-–—])`;
+  const match = line.trim().match(
+    new RegExp(`^(.*?)\\s+(${cell}(?:\\s+${cell}){2,})$`),
+  );
+  if (!match) return null;
+  const values = match[2].trim().split(/\s+/);
+  if (values.length < 3) return null;
+  const labelText = match[1].trim();
+  return labelText ? [labelText, ...values] : values;
+}
+
+function normalizeJournalTables(lines: string[]): string[] {
+  const output: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index].trim();
+    if (
+      !/\bdate\b/i.test(header) ||
+      !/\bdetails?\b/i.test(header) ||
+      !/\bamount\b/i.test(header) ||
+      !/\bdr\b/i.test(header) ||
+      !/\bcr\b/i.test(header)
+    ) {
+      output.push(lines[index]);
+      continue;
+    }
+
+    const rows: string[][] = [];
+    let cursor = index + 1;
+    let incompleteRowStart: number | null = null;
+    while (cursor < lines.length) {
+      const rowStart = cursor;
+      const dateMatch = lines[cursor]
+        .trim()
+        .match(/^(\d{1,2}[-/](?:[a-z]{3}|\d{1,2})[-/]\d{2,4})(?:\s+(.*))?$/i);
+      if (!dateMatch) break;
+      incompleteRowStart = rowStart;
+      const date = dateMatch[1];
+      const details = dateMatch[2] ? [dateMatch[2].trim()] : [];
+      const amounts: string[] = [];
+      cursor += 1;
+      while (cursor < lines.length && amounts.length < 2) {
+        const line = lines[cursor].trim();
+        if (/^\d{1,2}[-/](?:[a-z]{3}|\d{1,2})[-/]\d{2,4}(?:\s|$)/i.test(line)) {
+          break;
+        }
+        if (/^\(?-?\d[\d,]*(?:\.\d+)?\)?$/.test(line)) {
+          amounts.push(line);
+        } else if (line) {
+          details.push(line);
+        }
+        cursor += 1;
+      }
+      if (amounts.length !== 2 || details.length === 0) break;
+      rows.push([date, details.join(" "), ...amounts]);
+      incompleteRowStart = null;
+    }
+
+    if (rows.length < 2) {
+      output.push(lines[index]);
+      continue;
+    }
+    output.push(
+      "| Date | Details | Amount Rs Dr | Amount Rs Cr |",
+      "| --- | --- | ---: | ---: |",
+      ...rows.map((row) => `| ${row.map(tableCellForMarkdown).join(" | ")} |`),
+    );
+    index = (incompleteRowStart ?? cursor) - 1;
+  }
+  return output;
 }
 
 function splitTabDelimitedRow(line: string): string[] | null {
@@ -613,6 +805,7 @@ type PageImageSource = {
   originalName: string;
   mimeType: string;
   pageNumbers?: number[];
+  displayPageNumber?: number;
 };
 
 function PageImageGallery({
@@ -657,9 +850,12 @@ function PageImageGallery({
           url: string;
         }> = [];
         for (const file of supported) {
-          const pageCount = await getTestPageCount(
-            `${API_BASE}${endpoint}/${file.id}/pages`,
-          );
+          const isImage = file.mimeType.startsWith("image/");
+          const pageCount = isImage
+            ? 1
+            : await getTestPageCount(
+                `${API_BASE}${endpoint}/${file.id}/pages`,
+              );
           if (cancelled) return;
           for (const pageNumber of new Set(file.pageNumbers ?? [])) {
             if (
@@ -671,12 +867,18 @@ function PageImageGallery({
             }
             if (cancelled) return;
             const blob = await getTestPageBlob(
-              `${API_BASE}${endpoint}/${file.id}/pages/${pageNumber}`,
+              isImage
+                ? `${API_BASE}${endpoint}/${file.id}`
+                : `${API_BASE}${endpoint}/${file.id}/pages/${pageNumber}`,
             );
             if (cancelled) return;
             const url = URL.createObjectURL(blob);
             urls.push(url);
-            output.push({ name: file.originalName, pageNumber, url });
+            output.push({
+              name: file.originalName,
+              pageNumber: file.displayPageNumber ?? pageNumber,
+              url,
+            });
           }
         }
         if (!cancelled) setPages(output);
@@ -783,7 +985,7 @@ function addPdfFormattedContent(
   const { x, width, bottom, addPage } = options;
   let y = options.y;
   const fontSize = options.fontSize ?? 10;
-  const lines = content.replace(/\r\n?/g, "\n").split("\n");
+  const lines = questionTextForPdf(content).replace(/\r\n?/g, "\n").split("\n");
   const plainText = (text: string) =>
     text.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/[*`]/g, "");
   const drawRichLine = (
@@ -3043,8 +3245,7 @@ function TestAttempt({
               </span>
               <b>Upload an answer file for Question {questionKey}</b>
               <small>
-                PDF, DOCX, TXT, or an image. PDF pages and clear photos are
-                checked with the configured vision-capable Ollama model.
+                PDF, DOCX, TXT, or an image.                 PDF pages and clear photos are reviewed automatically.
                 Up to 30 MiB combined.
               </small>
               {questionFiles[questionKey] && (
@@ -3054,7 +3255,7 @@ function TestAttempt({
             <label className="field-label">
               Or submit one complete paper (replaces per-question uploads; up
               to 30 pages and 30 MiB). PDF pages and clear photos are checked
-              with the configured vision-capable Ollama model.
+              through our automatic review system.
               <input
                 type="file"
                 accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.webp"
@@ -5322,7 +5523,7 @@ async function exportTestQuestions(test: Data) {
     pdf.setFontSize(11);
     y = addPdfFormattedContent(
       pdf,
-      String(question.questionText ?? "").trim() ||
+      questionTextForPdf(String(question.questionText ?? "").trim()) ||
         "(Question text unavailable)",
       {
         x: margin,
@@ -5956,6 +6157,44 @@ function AttemptReview({
     [fileBusy, setFileBusy] = useState(""),
     [retryBusy, setRetryBusy] = useState(false),
     [hasReviewRequest, setHasReviewRequest] = useState(false);
+  const refreshAttemptsRef = useRef(refreshAttempts);
+  useEffect(() => {
+    refreshAttemptsRef.current = refreshAttempts;
+  }, [refreshAttempts]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (
+        rows.some((attempt) =>
+          ["SUBMITTED", "PROCESSING"].includes(
+            String(attempt.status ?? "").toUpperCase(),
+          ),
+        )
+      ) {
+        void refreshAttemptsRef.current();
+      }
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [rows]);
+  useEffect(() => {
+    if (!selectedAttempt?.id) return;
+    const refreshed = rows.find(
+      (attempt) => getId(attempt) === getId(selectedAttempt),
+    );
+    if (refreshed && refreshed !== selectedAttempt) {
+      setSelectedAttempt(refreshed);
+    }
+  }, [rows, selectedAttempt]);
+  const attemptFiles = asArray<Data>(selectedAttempt?.files);
+  const hasOriginalPaperPdf = attemptFiles.some((file) =>
+    /^paper-source-.+\.pdf$/i.test(String(file.originalName ?? "")),
+  );
+  const downloadableAttemptFiles = attemptFiles.filter(
+    (file) =>
+      !(
+        hasOriginalPaperPdf &&
+        /^paper-page-\d+\./i.test(String(file.originalName ?? ""))
+      ),
+  );
   async function update(path: string, body: unknown) {
     try {
       await api(path, json("PUT", body));
@@ -6185,11 +6424,17 @@ function AttemptReview({
 
           <section className="submission-files">
             <h4>Uploaded answers</h4>
-            {asArray<Data>(selectedAttempt.files).length ? (
-              asArray<Data>(selectedAttempt.files).map((file) => (
+            {downloadableAttemptFiles.length ? (
+              downloadableAttemptFiles.map((file) => (
                 <div className="submission-file-row" key={getId(file)}>
                   <div>
-                    <b>{file.originalName ?? "Submission file"}</b>
+                    <b>
+                      {/^paper-source-.+\.pdf$/i.test(
+                        String(file.originalName ?? ""),
+                      )
+                        ? "Original complete-paper PDF"
+                        : (file.originalName ?? "Submission file")}
+                    </b>
                     <small>
                       {file.questionNumber
                         ? `Question ${file.questionNumber} · `
@@ -6216,6 +6461,38 @@ function AttemptReview({
                 No uploaded files for this attempt.
               </p>
             )}
+            {(() => {
+              const uploadedPages = attemptFiles
+                .filter((file) =>
+                  String(file.mimeType ?? "").startsWith("image/"),
+                )
+                .map((file) => {
+                  const originalName = String(
+                    file.originalName ?? "Student answer",
+                  );
+                  const pageMatch = originalName.match(
+                    /^(?:paper|question-\d+)-page-(\d+)\./i,
+                  );
+                  return {
+                    id: getId(file),
+                    originalName,
+                    mimeType: String(file.mimeType ?? ""),
+                    pageNumbers: [1],
+                    ...(pageMatch
+                      ? { displayPageNumber: Number(pageMatch[1]) }
+                      : {}),
+                  };
+                });
+              return uploadedPages.length ? (
+                <details className="admin-answer-pages">
+                  <summary>Preview all uploaded answer pages</summary>
+                  <PageImageGallery
+                    endpoint={`/api/tests/${testId}/attempts/files`}
+                    files={uploadedPages}
+                  />
+                </details>
+              ) : null;
+            })()}
           </section>
 
           <section className="admin-assessment-report">
@@ -6238,7 +6515,7 @@ function AttemptReview({
                           {question.marksAwarded} / {question.marksAvailable}
                         </span>
                       </div>
-                      <details className="admin-answer-pages">
+                      <details className="admin-answer-pages" open>
                         <summary>
                           View original question and ideal solution pages
                         </summary>
@@ -6271,23 +6548,59 @@ function AttemptReview({
                           <PageImageGallery
                             endpoint={`/api/tests/${testId}/attempts/files`}
                             emptyMessage="No original answer page is mapped to this question."
-                            files={asArray<Data>(selectedAttempt.files)
-                              .filter(
+                            files={(() => {
+                              const studentPages = new Set(
+                                asArray<number>(question.studentPageNumbers),
+                              );
+                              const matching = asArray<Data>(selectedAttempt.files)
+                                .filter(
+                                  (file) =>
+                                    file.questionNumber == null ||
+                                    Number(file.questionNumber) ===
+                                      Number(question.questionNumber),
+                                )
+                                .map((file) => {
+                                  const originalName = String(
+                                    file.originalName ?? "Student answer",
+                                  );
+                                  const mimeType = String(file.mimeType ?? "");
+                                  const completePage = originalName.match(
+                                    /^paper-page-(\d+)\./i,
+                                  );
+                                  const pageNumber = completePage
+                                    ? Number(completePage[1])
+                                    : null;
+                                  return {
+                                    id: getId(file),
+                                    originalName,
+                                    mimeType,
+                                    pageNumbers:
+                                      pageNumber !== null
+                                        ? studentPages.has(pageNumber)
+                                          ? [1]
+                                          : []
+                                        : mimeType.startsWith("image/")
+                                          ? [1]
+                                          : studentPages.size
+                                            ? [...studentPages]
+                                            : [],
+                                    ...(pageNumber !== null
+                                      ? { displayPageNumber: pageNumber }
+                                      : {}),
+                                  };
+                                });
+                              const hasRenderedPaperPages = matching.some(
                                 (file) =>
-                                  file.questionNumber == null ||
-                                  Number(file.questionNumber) ===
-                                    Number(question.questionNumber),
-                              )
-                              .map((file) => ({
-                                id: getId(file),
-                                originalName: String(
-                                  file.originalName ?? "Student answer",
-                                ),
-                                mimeType: String(file.mimeType ?? ""),
-                                pageNumbers: asArray<number>(
-                                  question.studentPageNumbers,
-                                ),
-                              }))}
+                                  /^paper-page-\d+\./i.test(file.originalName),
+                              );
+                              return matching.filter(
+                                (file) =>
+                                  !(
+                                    hasRenderedPaperPages &&
+                                    /^paper-source-/i.test(file.originalName)
+                                  ),
+                              );
+                            })()}
                           />
                         </details>
                       )}
@@ -6327,7 +6640,13 @@ function AttemptReview({
             ) : (
               <p className="subtle-padding">
                 {selectedAttempt.gradingError ??
-                  "The automated assessment is not available for this attempt."}
+                  (String(selectedAttempt.status).toUpperCase() ===
+                  "PROCESSING"
+                    ? "AI assessment is running. This report will update automatically."
+                    : String(selectedAttempt.status).toUpperCase() ===
+                        "SUBMITTED"
+                      ? "AI assessment is queued. It will start when the server grading worker runs; if this remains queued, check the HostGator cPanel cron job."
+                      : "No AI assessment report is available for this attempt. Retry assessment to queue it for AI grading.")}
               </p>
             )}
           </section>
@@ -6593,7 +6912,7 @@ function CreateTest({
       if (importFiles.length) {
         const sourceForm = new FormData();
         importFiles.forEach((file) =>
-          sourceForm.append("files", file, file.name),
+          sourceForm.append("files[]", file, file.name),
         );
         try {
           await api(`/tests/${getId(created)}/source-files`, {

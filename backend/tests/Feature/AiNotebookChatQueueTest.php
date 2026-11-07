@@ -37,12 +37,19 @@ class AiNotebookChatQueueTest extends TestCase
             public array $questions = [];
             public array $messages = [];
             public array $timeouts = [];
+            public array $maxTokens = [];
 
-            public function complete(array $messages, bool $jsonResponse = false, ?int $timeoutOverride = null): string
+            public function complete(
+                array $messages,
+                bool $jsonResponse = false,
+                ?int $timeoutOverride = null,
+                ?int $maxTokens = null
+            ): string
             {
                 $this->calls++;
                 $this->messages[] = $messages;
                 $this->timeouts[] = $timeoutOverride;
+                $this->maxTokens[] = $maxTokens;
                 $last = $messages[count($messages) - 1]['content'] ?? '';
                 $this->questions[] = is_string($last)
                     ? $last
@@ -144,6 +151,11 @@ class AiNotebookChatQueueTest extends TestCase
             ->assertExactJson($firstResponse);
         self::assertSame(1, $this->chatClient->calls);
         self::assertSame([60], $this->chatClient->timeouts);
+        self::assertSame([2048], $this->chatClient->maxTokens);
+        self::assertStringContainsString(
+            '3-6 concise paragraphs',
+            $this->chatClient->messages[0][0]['content']
+        );
         self::assertSame(2, DB::table('ai_notebook_chat_messages')->count());
         self::assertSame(1, (int) DB::table('ai_notebook_daily_usage')
             ->where('userId', $this->firstStudentId)->value('requestCount'));

@@ -104,6 +104,27 @@ class OllamaChatClientTest extends TestCase
         Http::assertSentCount(1);
     }
 
+    public function test_notebook_output_token_limit_is_sent_only_when_requested(): void
+    {
+        Http::fake([
+            'ollama.example.test/*' => Http::response([
+                'choices' => [['message' => ['content' => 'A detailed answer.']]],
+            ]),
+        ]);
+        $client = app(CloudChatClient::class);
+        $messages = [['role' => 'user', 'content' => 'Explain this topic.']];
+
+        $client->complete($messages);
+        $client->complete($messages, false, 60, 2048);
+        $client->complete($messages, true);
+
+        Http::assertSentCount(3);
+        $requests = Http::recorded()->map(static fn (array $pair) => $pair[0]);
+        self::assertFalse(isset($requests[0]['max_tokens']));
+        self::assertSame(2048, $requests[1]['max_tokens']);
+        self::assertFalse(isset($requests[2]['max_tokens']));
+    }
+
     public function test_it_sends_image_content_to_a_vision_capable_model(): void
     {
         Config::set('services.ai_chat.model', 'gemma4:31b');

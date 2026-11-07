@@ -295,6 +295,7 @@ class AiNotebookController
             'You are a subject-specific learning assistant for '.($subject->name ?? 'the selected subject').'. '.
             'Answer accurately using the supplied source excerpts. If they do not contain the answer, say so plainly. '.
             'Do not invent citations. Respond in '.str_replace('_', ' ', $language).'. '.
+            'For ordinary questions, give a substantive teaching explanation: usually 3-6 concise paragraphs or equivalent structured bullets, define key terms, explain the reasoning, and include relevant source-backed examples when useful. Avoid one-line answers unless the user asks for a brief fact. Do not pad or go beyond the supplied sources. '.
             $prompt
         );
         if (($input['studyAidMode'] ?? null) === 'summary') {
@@ -696,6 +697,7 @@ class AiNotebookController
             'You are a subject-specific learning assistant for '.($subject->name ?? 'the selected subject').'. '.
             'Answer accurately using the supplied source excerpts. If they do not contain the answer, say so plainly. '.
             'Do not invent citations. Respond in '.str_replace('_', ' ', $language).'. '.
+            'For ordinary questions, give a substantive teaching explanation: usually 3-6 concise paragraphs or equivalent structured bullets, define key terms, explain the reasoning, and include relevant source-backed examples when useful. Avoid one-line answers unless the user asks for a brief fact. Do not pad or go beyond the supplied sources. '.
             $prompt
         );
         if ($ticket->study_aid_mode === 'summary') {
@@ -734,7 +736,11 @@ class AiNotebookController
                         ['type' => 'text', 'text' => $userQuestion],
                         ['type' => 'image_url', 'image_url' => ['url' => 'data:'.$image['mimeType'].';base64,'.base64_encode($image['buffer'])]],
                     ]],
-            ], $ticket->study_aid_mode === 'mind_map', (int) config('services.ai_chat.notebook_timeout', 60));
+            ],
+            $ticket->study_aid_mode === 'mind_map',
+            (int) config('services.ai_chat.notebook_timeout', 60),
+            (int) config('services.ai_chat.notebook_max_tokens', 2048)
+        );
         $studyAid = null;
         if ($ticket->study_aid_mode === 'mind_map') {
             $studyAid = $this->parseMindMap($answer);

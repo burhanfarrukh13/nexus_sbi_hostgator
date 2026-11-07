@@ -14,6 +14,7 @@ return [
         'model' => env('OLLAMA_MODEL'),
         'timeout' => (int) env('OLLAMA_TIMEOUT_SECONDS', 300),
         'notebook_timeout' => (int) env('OLLAMA_CHAT_TIMEOUT_SECONDS', 60),
+        'notebook_max_tokens' => max(256, min(4096, (int) env('OLLAMA_CHAT_MAX_TOKENS', 2048))),
         'connect_timeout' => (int) env('OLLAMA_CONNECT_TIMEOUT_SECONDS', 15),
         'retry_delays' => [1, 3, 8],
     ],

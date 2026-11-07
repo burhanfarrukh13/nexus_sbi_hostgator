@@ -322,17 +322,18 @@ class TestAssessmentService
         $questionNumbers = array_map(static fn (array $question): int => (int) $question['questionNumber'], $questions);
         $transcriptions = [];
         $activeQuestionNumber = null;
+        $questionContextBlocked = false;
         foreach ($images as $image) {
             $imagePage = (int) ($image['pageNumber'] ?? 1);
             $messages = [
                 [
                     'role' => 'system',
-                    'content' => 'Transcribe only the student answer writing visible on this page. Do not grade or solve it. Match answers only to explicit top-level labels such as Question 3, Q3, Answer #3, or Ans. 3; bare numbered list items and roman subparts are not question labels. Preserve subpart labels, calculations, table rows, numbers, and line breaks. Ignore teacher corrections and marks. Do not invent unreadable content; describe uncertainty. Return JSON with activeQuestionNumber, activeQuestionHeading, and transcriptions array containing one row per supplied question number with questionNumber, answerText, and uncertainty. Use activeQuestionNumber null when no answer section continues.',
+                    'content' => 'Transcribe only the student answer writing visible on this page. Do not grade or solve it. Match answers only to explicit top-level labels such as Question 3, Q3, Answer #3, or Ans. 3; bare numbered list items and roman subparts are not question labels. A page belongs to one active question: return at most one transcription row, only for that question. Never duplicate visible writing into other question numbers or emit speculative rows. A new question requires a clear explicit heading; otherwise continue priorPageContext. Preserve subpart labels, calculations, table rows, numbers, and line breaks. Ignore teacher corrections and marks. Do not invent unreadable content; describe uncertainty. Return JSON with activeQuestionNumber, activeQuestionHeading, and transcriptions array containing questionNumber, answerText, and uncertainty. Use activeQuestionNumber null when neither a heading nor prior-page continuation identifies a question.',
                 ],
                 [
                     'role' => 'user',
                     'content' => $this->visionContent(json_encode([
-                        'instructions' => 'Transcribe this page only. A clear explicit heading overrides the previous-page continuation. Preserve tables as Markdown pipe tables.',
+                        'instructions' => 'Transcribe this page only. Return rows for only one question. A clear explicit heading overrides the previous-page continuation; without one, use priorPageContext. If the page has no identifiable question, return no rows. Preserve tables as Markdown pipe tables.',
                         'pageNumber' => $imagePage,
                         'totalPages' => count($images),
                         'requestedQuestionNumbers' => $questionNumbers,
@@ -363,25 +364,51 @@ class TestAssessmentService
                 ? preg_replace('/[^a-z0-9]/', '', strtolower($result['activeQuestionHeading']))
                 : '';
             preg_match('/^(?:question|q|answer)(?:no|number)?0*(\d+)$/', (string) $heading, $headingMatch);
-            $verifiedHeading = isset($headingMatch[1]) && (int) $headingMatch[1] === (int) $reportedActive;
-            $unheadedChange = is_numeric($reportedActive) && $activeQuestionNumber !== null &&
-                (int) $reportedActive !== $activeQuestionNumber && !$verifiedHeading;
-            $lastQuestionWithAnswer = null;
+            $headingNumber = isset($headingMatch[1]) ? (int) $headingMatch[1] : null;
+            $hasExplicitHeading = $headingNumber !== null;
+            $reportedNumber = is_numeric($reportedActive) ? (int) $reportedActive : null;
+            if ($hasExplicitHeading && in_array($headingNumber, $questionNumbers, true)) {
+                $pageQuestionNumber = $headingNumber;
+                $questionContextBlocked = false;
+            } elseif ($hasExplicitHeading) {
+                $pageQuestionNumber = null;
+                $questionContextBlocked = true;
+            } elseif ($questionContextBlocked) {
+                $pageQuestionNumber = null;
+            } elseif ($reportedNumber !== null && $reportedNumber === $activeQuestionNumber) {
+                $pageQuestionNumber = $activeQuestionNumber;
+            } elseif ($activeQuestionNumber === null && $reportedNumber !== null &&
+                in_array($reportedNumber, $questionNumbers, true)) {
+                $pageQuestionNumber = $reportedNumber;
+            } elseif ($activeQuestionNumber === null) {
+                $nonEmptyRows = array_values(array_filter(
+                    $result['transcriptions'],
+                    static fn (mixed $row): bool => is_array($row) &&
+                        is_string($row['answerText'] ?? null) &&
+                        trim($row['answerText']) !== ''
+                ));
+                $pageQuestionNumber = count($nonEmptyRows) === 1
+                    ? (int) ($nonEmptyRows[0]['questionNumber'] ?? 0)
+                    : null;
+            } else {
+                $pageQuestionNumber = $activeQuestionNumber;
+            }
+            if ($pageQuestionNumber !== null &&
+                !in_array($pageQuestionNumber, $questionNumbers, true)) {
+                $pageQuestionNumber = null;
+            }
+
             foreach ($result['transcriptions'] as $row) {
                 if (!is_array($row) || !is_string($row['answerText'] ?? null)) {
                     continue;
                 }
-                $reportedNumber = (int) ($row['questionNumber'] ?? 0);
-                $number = $unheadedChange && trim($row['answerText']) !== ''
-                    ? $activeQuestionNumber
-                    : $reportedNumber;
-                if (!in_array($number, $questionNumbers, true)) {
+                $number = (int) ($row['questionNumber'] ?? 0);
+                if ($pageQuestionNumber === null || $number !== $pageQuestionNumber) {
                     continue;
                 }
                 $answerText = trim($row['answerText']);
                 $uncertainty = trim((string) ($row['uncertainty'] ?? ''));
                 if ($answerText !== '') {
-                    $lastQuestionWithAnswer = $number;
                     $previous = $transcriptions[$number] ?? ['text' => '', 'uncertainty' => '', 'pages' => []];
                     $pageText = "[Page {$imagePage}]\n{$answerText}";
                     $transcriptions[$number] = [
@@ -391,10 +418,10 @@ class TestAssessmentService
                     ];
                 }
             }
-            if (is_numeric($reportedActive) && in_array((int) $reportedActive, $questionNumbers, true) && !$unheadedChange) {
-                $activeQuestionNumber = (int) $reportedActive;
-            } elseif ($lastQuestionWithAnswer !== null) {
-                $activeQuestionNumber = $lastQuestionWithAnswer;
+            if ($pageQuestionNumber !== null) {
+                $activeQuestionNumber = $pageQuestionNumber;
+            } elseif ($hasExplicitHeading) {
+                $activeQuestionNumber = null;
             }
         }
 
@@ -406,19 +433,39 @@ class TestAssessmentService
         $paperPages = array_values(array_filter($images, static fn (array $image): bool => !empty($image['completePaper'])));
         $questionImages = array_values(array_filter($images, static fn (array $image): bool => empty($image['completePaper'])));
         if (count($paperPages) > 6) {
-            $preferred = [];
-            foreach ($transcriptions as $transcription) {
-                foreach ($transcription['pages'] as $pageNumber) {
-                    $preferred[$pageNumber] = true;
-                    if (count($preferred) >= 6) {
-                        break 2;
+            $availablePages = [];
+            foreach ($paperPages as $image) {
+                $availablePages[(int) ($image['pageNumber'] ?? 0)] = $image;
+            }
+            $prioritizedPages = [];
+            $pageOffset = 0;
+            do {
+                $addedAtOffset = false;
+                foreach ($transcriptions as $transcription) {
+                    $pageNumber = $transcription['pages'][$pageOffset] ?? null;
+                    if (is_int($pageNumber) && isset($availablePages[$pageNumber]) &&
+                        !isset($prioritizedPages[$pageNumber])) {
+                        $prioritizedPages[$pageNumber] = true;
+                        $addedAtOffset = true;
+                    }
+                }
+                $pageOffset++;
+            } while ($addedAtOffset && count($prioritizedPages) < 6);
+            if (count($prioritizedPages) < 6) {
+                foreach ($paperPages as $image) {
+                    $pageNumber = (int) ($image['pageNumber'] ?? 0);
+                    if ($pageNumber > 0) {
+                        $prioritizedPages[$pageNumber] = true;
+                    }
+                    if (count($prioritizedPages) >= 6) {
+                        break;
                     }
                 }
             }
-            $selected = array_values(array_filter($paperPages, static fn (array $image): bool =>
-                isset($preferred[$image['pageNumber'] ?? 0])
+            $paperPages = array_values(array_map(
+                static fn (int $pageNumber): array => $availablePages[$pageNumber],
+                array_slice(array_keys($prioritizedPages), 0, 6)
             ));
-            $paperPages = array_slice($selected !== [] ? $selected : $paperPages, 0, 6);
         }
 
         return [...$questionImages, ...$paperPages];
@@ -733,6 +780,9 @@ class TestAssessmentService
             ->where('attempt_id', $attemptId)
             ->orderBy('created_at')
             ->get(['original_name', 'mime_type', 'question_number', 'storage_key']);
+        $hasCompletePaperImagePages = $files->contains(static fn (object $file): bool =>
+            preg_match('/^paper-page-\d+\.(?:jpg|jpeg|png|webp)$/i', (string) $file->original_name) === 1
+        );
 
         foreach ($files as $file) {
             if (!is_string($file->storage_key) || $file->storage_key === '') {
@@ -745,7 +795,7 @@ class TestAssessmentService
             }
             $name = (string) $file->original_name;
             $mimeType = (string) $file->mime_type;
-            $isCompletePaper = preg_match('/^paper(?:-page-\d+)?\./i', $name) === 1;
+            $isCompletePaper = preg_match('/^paper(?:-page-\d+|-source-.+)?\./i', $name) === 1;
             if (str_starts_with($mimeType, 'image/')) {
                 $pageCountTotal++;
                 $image = [
@@ -771,27 +821,30 @@ class TestAssessmentService
             $extension = strtolower(pathinfo($name, PATHINFO_EXTENSION));
             if ($extension === 'pdf') {
                 $text = $this->extractStoredText($name, $bytes, $path);
-                $pageCount = $this->renderer->pageCount($path);
-                $pageCountTotal += $pageCount;
-                try {
-                    $renderedPages = $this->renderer->renderAll($path);
-                    foreach ($renderedPages as $page) {
-                        $image = [
-                            ...$page,
-                            'completePaper' => $isCompletePaper,
-                            'pageNumber' => $page['pageNumber'],
-                        ];
-                        if (!$isCompletePaper && $file->question_number !== null) {
-                            $image['questionNumber'] = (int) $file->question_number;
+                $isPreservedPaperSource = preg_match('/^paper-source-/i', $name) === 1;
+                if (!$isPreservedPaperSource || !$hasCompletePaperImagePages) {
+                    $pageCount = $this->renderer->pageCount($path);
+                    $pageCountTotal += $pageCount;
+                    try {
+                        $renderedPages = $this->renderer->renderAll($path);
+                        foreach ($renderedPages as $page) {
+                            $image = [
+                                ...$page,
+                                'completePaper' => $isCompletePaper,
+                                'pageNumber' => $page['pageNumber'],
+                            ];
+                            if (!$isCompletePaper && $file->question_number !== null) {
+                                $image['questionNumber'] = (int) $file->question_number;
+                            }
+                            $images[] = $image;
                         }
-                        $images[] = $image;
-                    }
-                } catch (RuntimeException $error) {
-                    if ($text === '') {
-                        throw new RuntimeException(
-                            'The scanned PDF has no readable text layer and server-side PDF rendering is unavailable.',
-                            previous: $error
-                        );
+                    } catch (RuntimeException $error) {
+                        if ($text === '') {
+                            throw new RuntimeException(
+                                'The scanned PDF has no readable text layer and server-side PDF rendering is unavailable.',
+                                previous: $error
+                            );
+                        }
                     }
                 }
                 if ($isCompletePaper && $text !== '') {

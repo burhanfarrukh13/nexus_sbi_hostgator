@@ -13,7 +13,7 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 class TestSubmissionService
 {
-    private const MAX_FILES = 30;
+    private const MAX_FILES = 31;
     private const MAX_FILE_BYTES = 30 * 1024 * 1024;
     private const MAX_TOTAL_BYTES = 30 * 1024 * 1024;
 
@@ -65,7 +65,7 @@ class TestSubmissionService
         }
 
         usort($questions, static fn (array $a, array $b): int => (int) $a['questionNumber'] <=> (int) $b['questionNumber']);
-        $completePaper = count(array_filter($prepared, static fn (array $file): bool => in_array($file['category'], ['paper', 'paper-page'], true))) > 0;
+        $completePaper = count(array_filter($prepared, static fn (array $file): bool => in_array($file['category'], ['paper', 'paper-page', 'paper-source'], true))) > 0;
         $questionFileNumbers = array_filter($prepared, static fn (array $file): bool => $file['category'] === 'question');
         $hasTypedAnswers = array_filter($answers, static fn (array $answer): bool =>
             trim((string) ($answer['answerText'] ?? '')) !== '' ||
@@ -517,6 +517,7 @@ class TestSubmissionService
             $questionPageMatch = preg_match('/^question-(\d+)-page-(\d+)\.[^.]+$/i', $name, $questionPage);
             $questionMatch = preg_match('/^question-(\d+)\.[^.]+$/i', $name, $question);
             $pageMatch = preg_match('/^paper-page-(\d+)\.[^.]+$/i', $name, $page);
+            $paperSource = preg_match('/^paper-source-.+\.pdf$/i', $name) === 1;
             $paper = preg_match('/^paper\.(pdf|docx|txt|jpg|jpeg|png|webp)$/i', $name) === 1;
             if ($questionMatch === 1) {
                 $questionNumber = (int) $question[1];
@@ -548,6 +549,14 @@ class TestSubmissionService
                 $seen["page-{$pageNumber}"] = true;
                 $category = 'paper-page';
                 $questionNumber = null;
+            } elseif ($paperSource && $isText && $extension === 'pdf') {
+                if ($hasPaper || isset($seen['paper-source'])) {
+                    throw new BadRequestHttpException('Submit only one complete paper document.');
+                }
+                $seen['paper-source'] = true;
+                $category = 'paper-source';
+                $questionNumber = null;
+                $pageNumber = null;
                 $hasPaper = true;
             } elseif ($paper) {
                 if ($hasPaper || isset($seen['paper'])) {
@@ -561,6 +570,13 @@ class TestSubmissionService
             } else {
                 throw new BadRequestHttpException("{$name}: use question-<number>.<ext>, paper.<ext>, or paper-page-<number>.<image-ext>.");
             }
+            $pageCount = null;
+            if ($category === 'paper-source') {
+                $pageCount = $this->pdfPageCount($bytes);
+                if ($pageCount === null) {
+                    throw new BadRequestHttpException("{$name}: could not read the PDF page count.");
+                }
+            }
             $prepared[] = [
                 'upload' => $upload,
                 'name' => $name,
@@ -569,11 +585,37 @@ class TestSubmissionService
                 'category' => $category,
                 'questionNumber' => $questionNumber,
                 'pageNumber' => $pageNumber,
-                // PDF text extraction and page counting are deferred to the worker.
-                // The web request only verifies its signature and stores the file.
+                // Other PDF text extraction and page counting are deferred to the worker.
+                // The preserved source copy is counted to verify its rendered pages here.
                 'extractedText' => $extension === 'pdf' ? '' : $this->extractText($extension, $bytes, $upload->getRealPath()),
-                'pageCount' => null,
+                'pageCount' => $pageCount,
             ];
+        }
+
+        $hasDirectPaper = count(array_filter(
+            $prepared,
+            static fn (array $file): bool => $file['category'] === 'paper'
+        )) > 0;
+        $hasPaperPages = count(array_filter(
+            $prepared,
+            static fn (array $file): bool => $file['category'] === 'paper-page'
+        )) > 0;
+        if ($hasDirectPaper && $hasPaperPages) {
+            throw new BadRequestHttpException('Do not submit both a PDF document and separate complete-paper pages.');
+        }
+
+        foreach ($prepared as $file) {
+            if ($file['category'] !== 'paper-source') {
+                continue;
+            }
+            $pageNumbers = array_map(
+                static fn (array $page): int => (int) $page['pageNumber'],
+                array_filter($prepared, static fn (array $page): bool => $page['category'] === 'paper-page')
+            );
+            sort($pageNumbers);
+            if ($pageNumbers !== range(1, (int) $file['pageCount'])) {
+                throw new BadRequestHttpException('Every page of the original PDF must be included with the upload.');
+            }
         }
 
         return $prepared;
@@ -620,6 +662,9 @@ class TestSubmissionService
     {
         $imageCount = 0;
         foreach ($prepared as $file) {
+            if ($file['category'] === 'paper-source') {
+                continue;
+            }
             $imageCount += str_starts_with($file['mimeType'], 'image/')
                 ? 1
                 : (int) ($file['pageCount'] ?? 0);

@@ -201,17 +201,30 @@ trait BuildsGradingFixtures
         ]);
     }
 
-    /** A valid one-page PDF whose text layer contains $text. */
-    protected function makePdf(string $text): string
+    /** A valid PDF with the requested page count and a text layer on each page. */
+    protected function makePdf(string $text, int $pageCount = 1): string
     {
-        $stream = "BT /F1 18 Tf 72 700 Td ({$text}) Tj ET";
+        $pageCount = max(1, $pageCount);
+        $pageIds = [];
+        for ($page = 1; $page <= $pageCount; $page++) {
+            $pageId = 3 + (($page - 1) * 2);
+            $pageIds[] = "{$pageId} 0 R";
+        }
+        $fontId = 3 + ($pageCount * 2);
         $objects = [
             1 => '<< /Type /Catalog /Pages 2 0 R >>',
-            2 => '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-            3 => '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
-            4 => '<< /Length '.strlen($stream)." >>\nstream\n{$stream}\nendstream",
-            5 => '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+            2 => '<< /Type /Pages /Kids ['.implode(' ', $pageIds).'] /Count '.$pageCount.' >>',
         ];
+        for ($page = 1; $page <= $pageCount; $page++) {
+            $pageId = 3 + (($page - 1) * 2);
+            $contentId = $pageId + 1;
+            $pageText = $text === '' ? '' : "{$text} Page {$page}";
+            $stream = "BT /F1 18 Tf 72 700 Td ({$pageText}) Tj ET";
+            $objects[$pageId] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {$contentId} 0 R /Resources << /Font << /F1 {$fontId} 0 R >> >> >>";
+            $objects[$contentId] = '<< /Length '.strlen($stream)." >>\nstream\n{$stream}\nendstream";
+        }
+        $objects[$fontId] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+        ksort($objects);
         $pdf = "%PDF-1.4\n";
         $offsets = [];
         foreach ($objects as $number => $body) {
