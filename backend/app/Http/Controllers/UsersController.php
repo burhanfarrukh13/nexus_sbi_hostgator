@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Services\UsersService;
+use App\Services\SubjectAccessService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
@@ -13,7 +14,10 @@ use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 
 class UsersController
 {
-    public function __construct(private readonly UsersService $users)
+    public function __construct(
+        private readonly UsersService $users,
+        private readonly SubjectAccessService $subjectAccess
+    )
     {
     }
 
@@ -22,15 +26,18 @@ class UsersController
         $identity = $request->attributes->get('apiIdentity');
         $permissions = $identity['adminPermissions'] ?? [];
         $isSuperAdmin = in_array('admin', $permissions, true);
+        $adminId = ($identity['role'] ?? null) === 'admin' && !$isSuperAdmin
+            ? (string) $identity['userId']
+            : null;
         $input = $this->validateQuery($request, ['email' => ['sometimes', 'string', 'email:rfc', 'min:3', 'max:254']]);
         $role = $isSuperAdmin ? null : 'student';
         if (array_key_exists('email', $input)) {
-            $user = $this->users->findByEmailPublic($input['email'], $role);
+            $user = $this->users->findByEmailPublic($input['email'], $role, $adminId);
 
             return response()->json($user ? [$user] : []);
         }
 
-        return response()->json($this->users->listUsers($role));
+        return response()->json($this->users->listUsers($role, $adminId));
     }
 
     public function store(Request $request): JsonResponse
@@ -53,6 +60,7 @@ class UsersController
                 'subjectIds' => ['sometimes', 'array', 'max:100'],
                 'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
             ]);
+            $this->assertSubjectsAccessible($input['subjectIds'] ?? [], (string) $identity['userId']);
 
             return response()->json(
                 $this->users->createStudent($input, (string) $identity['userId']),
@@ -79,11 +87,16 @@ class UsersController
             'subjectIds' => ['present', 'array', 'max:100'],
             'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
         ]);
+        $identity = $request->attributes->get('apiIdentity');
+        $this->subjectAccess->assertStudentAccessible((string) $identity['userId'], $userId);
+        $this->assertSubjectsAccessible($input['subjectIds'], (string) $identity['userId']);
+        $manageableSubjectIds = $this->subjectAccess->allowedSubjectIds((string) $identity['userId']);
 
         return response()->json($this->users->updateStudentSubjects(
             $userId,
             $input['subjectIds'],
-            (string) $request->attributes->get('apiIdentity')['userId']
+            (string) $identity['userId'],
+            $manageableSubjectIds
         ));
     }
 
@@ -92,8 +105,19 @@ class UsersController
         $identity = $request->attributes->get('apiIdentity');
         $permissions = $identity['adminPermissions'] ?? [];
         $role = in_array('admin', $permissions, true) ? null : 'student';
+        $adminId = ($identity['role'] ?? null) === 'admin' && $role === 'student'
+            ? (string) $identity['userId']
+            : null;
 
-        return response()->json($this->users->searchByEmail((string) $request->query('email', ''), 25, $role));
+        return response()->json($this->users->searchByEmail((string) $request->query('email', ''), 25, $role, $adminId));
+    }
+
+    private function assertSubjectsAccessible(array $subjectIds, string $adminId): void
+    {
+        $allowed = $this->subjectAccess->allowedSubjectIds($adminId);
+        if ($allowed !== null && array_diff($subjectIds, $allowed) !== []) {
+            throw new AccessDeniedHttpException('You can only manage students in your assigned subjects.');
+        }
     }
 
     private function validateBody(Request $request, array $rules): array

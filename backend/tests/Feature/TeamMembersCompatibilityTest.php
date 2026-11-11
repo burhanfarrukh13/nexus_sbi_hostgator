@@ -133,6 +133,88 @@ class TeamMembersCompatibilityTest extends TestCase
         $this->assertDatabaseMissing('user_role_assignments', ['userId' => $member]);
     }
 
+    public function test_super_admin_can_edit_team_member_details_permissions_and_subject_scope(): void
+    {
+        $actor = $this->createUser('owner@example.test', 'admin', ['admin']);
+        $member = $this->createUser('member@example.test', 'admin', ['teacher_assistant']);
+        $subjectId = (string) Str::uuid();
+        DB::table('subjects')->insert([
+            'id' => $subjectId,
+            'code' => 'EDIT-1',
+            'name' => 'Editing',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $this->withToken($this->token($actor))
+            ->putJson('/api/team-members/'.$member, [
+                'fullName' => 'Edited Member',
+                'email' => 'edited@example.test',
+                'phone' => '+1 555 0111',
+                'permissions' => ['testing_manager', 'user_manager'],
+                'subjectIds' => [$subjectId],
+            ])
+            ->assertOk()
+            ->assertJsonPath('fullName', 'Edited Member')
+            ->assertJsonPath('email', 'edited@example.test')
+            ->assertJsonPath('phone', '+1 555 0111')
+            ->assertJsonPath('permissions', ['testing_manager', 'user_manager'])
+            ->assertJsonPath('subjectIds.0', $subjectId)
+            ->assertJsonMissingPath('password');
+
+        $this->assertDatabaseHas('users', [
+            'id' => $member,
+            'email' => 'edited@example.test',
+            'fullName' => 'Edited Member',
+            'phone' => '+1 555 0111',
+        ]);
+        $this->assertSame(
+            ['testing_manager', 'user_manager'],
+            DB::table('user_role_assignments')->where('userId', $member)->orderBy('permission')->pluck('permission')->all()
+        );
+        $this->assertDatabaseHas('team_member_subject_access', [
+            'user_id' => $member,
+            'subject_id' => $subjectId,
+            'granted_by_user_id' => $actor,
+        ]);
+        $this->assertDatabaseHas('audit_logs', [
+            'event' => 'team_member_updated',
+            'userId' => $actor,
+        ]);
+    }
+
+    public function test_super_admin_can_delete_team_member_but_not_self_or_last_super_admin(): void
+    {
+        $actor = $this->createUser('owner@example.test', 'admin', ['admin']);
+        $member = $this->createUser('member@example.test', 'admin', ['teacher_assistant']);
+        $token = $this->token($actor);
+
+        $this->withToken($token)
+            ->deleteJson('/api/team-members/'.$member)
+            ->assertOk()
+            ->assertJson(['success' => true]);
+        $this->assertDatabaseMissing('users', ['id' => $member]);
+        $this->assertDatabaseHas('audit_logs', [
+            'event' => 'team_member_deleted',
+            'userId' => $actor,
+        ]);
+
+        $this->withToken($token)
+            ->deleteJson('/api/team-members/'.$actor)
+            ->assertBadRequest()
+            ->assertJsonPath('message', 'You cannot delete your own account.');
+
+        $otherSuperAdmin = $this->createUser('second-owner@example.test', 'admin', ['admin']);
+        $this->withToken($token)
+            ->deleteJson('/api/team-members/'.$actor)
+            ->assertBadRequest()
+            ->assertJsonPath('message', 'You cannot delete your own account.');
+        $this->withToken($this->token($otherSuperAdmin))
+            ->deleteJson('/api/team-members/'.$actor)
+            ->assertOk();
+        $this->assertDatabaseHas('users', ['id' => $otherSuperAdmin]);
+    }
+
     public function test_password_manager_can_reset_students_and_force_password_change(): void
     {
         $actor = $this->createUser('password.manager@example.test', 'admin', ['password_manager']);
@@ -180,6 +262,64 @@ class TeamMembersCompatibilityTest extends TestCase
             ->putJson('/api/team-members/'.$actor.'/password', ['newPassword' => 'new-admin-password'])
             ->assertBadRequest()
             ->assertJsonPath('message', 'Use the self-service password change flow for your own account');
+    }
+
+    public function test_scoped_password_manager_can_reset_only_students_in_assigned_subjects(): void
+    {
+        $actor = $this->createUser('scoped.manager@example.test', 'admin', ['password_manager']);
+        $allowedStudent = $this->createUser('allowed.student@example.test', 'student');
+        $otherStudent = $this->createUser('other.student@example.test', 'student');
+        $allowedSubject = (string) Str::uuid();
+        $otherSubject = (string) Str::uuid();
+
+        foreach ([[$allowedSubject, 'BIO'], [$otherSubject, 'CHEM']] as [$subjectId, $code]) {
+            DB::table('subjects')->insert([
+                'id' => $subjectId,
+                'code' => $code,
+                'name' => $code,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+        DB::table('subject_user_access')->insert([
+            [
+                'subject_id' => $allowedSubject,
+                'user_id' => $allowedStudent,
+                'created_at' => now(),
+            ],
+            [
+                'subject_id' => $otherSubject,
+                'user_id' => $otherStudent,
+                'created_at' => now(),
+            ],
+        ]);
+        DB::table('team_member_subject_access')->insert([
+            'user_id' => $actor,
+            'subject_id' => $allowedSubject,
+            'created_at' => now(),
+        ]);
+        $token = $this->token($actor);
+
+        $this->withToken($token)
+            ->putJson('/api/team-members/'.$allowedStudent.'/password', [
+                'newPassword' => 'allowed-student-password',
+            ])
+            ->assertCreated()
+            ->assertJson(['success' => true]);
+        $this->withToken($token)
+            ->putJson('/api/team-members/'.$otherStudent.'/password', [
+                'newPassword' => 'other-student-password',
+            ])
+            ->assertForbidden();
+
+        self::assertTrue(Hash::check(
+            'allowed-student-password',
+            DB::table('users')->where('id', $allowedStudent)->value('password')
+        ));
+        self::assertFalse(Hash::check(
+            'other-student-password',
+            DB::table('users')->where('id', $otherStudent)->value('password')
+        ));
     }
 
     public function test_super_admin_must_prove_their_password_to_reset_non_super_admin_team_member(): void

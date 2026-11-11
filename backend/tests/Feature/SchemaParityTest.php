@@ -17,6 +17,8 @@ class SchemaParityTest extends TestCase
     private const MIGRATIONS = [
         'database/migrations/2026_11_04_000001_create_test_notebook_schema.php',
         'database/migrations/2026_11_05_000001_create_ai_notebook_chat_tickets.php',
+        'database/migrations/2026_11_10_000001_create_team_member_subject_access.php',
+        'database/migrations/2026_11_11_000001_add_archived_at_to_tests.php',
     ];
 
     /** @return array<string, array{columns: list<string>, indexes: list<string>, foreignKeys: list<string>, checks: list<string>}> */

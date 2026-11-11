@@ -6,6 +6,7 @@ use App\Services\CloudChatClient;
 use App\Services\CloudEmbeddingClient;
 use App\Services\ImageCompactor;
 use App\Services\PrivateFileStorage;
+use App\Services\SubjectAccessService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -32,7 +33,8 @@ class AiNotebookController
         private readonly PrivateFileStorage $storage,
         private readonly CloudEmbeddingClient $embeddings,
         private readonly CloudChatClient $chatClient,
-        private readonly ImageCompactor $imageCompactor
+        private readonly ImageCompactor $imageCompactor,
+        private readonly SubjectAccessService $subjectAccess
     ) {
     }
 
@@ -40,10 +42,7 @@ class AiNotebookController
     {
         $identity = $this->identity($request);
         $query = DB::table('subjects');
-        if (($identity['role'] ?? null) === 'student') {
-            $query->join('subject_user_access', 'subject_user_access.subject_id', '=', 'subjects.id')
-                ->where('subject_user_access.user_id', $identity['userId']);
-        }
+        $this->subjectAccess->constrainSubjects($query, (string) $identity['userId']);
 
         return response()->json($query->orderBy('subjects.name')->get([
             'subjects.id',
@@ -225,14 +224,11 @@ class AiNotebookController
         $identity = $this->identity($request);
         $query = DB::table('ai_notebook_chat_sessions')
             ->where('user_id', $identity['userId']);
-        if (($identity['role'] ?? null) === 'student') {
-            $query->whereExists(function ($access): void {
-                $access->select(DB::raw(1))
-                    ->from('subject_user_access')
-                    ->whereColumn('subject_user_access.subject_id', 'ai_notebook_chat_sessions.subject_id')
-                    ->whereColumn('subject_user_access.user_id', 'ai_notebook_chat_sessions.user_id');
-            });
-        }
+        $this->subjectAccess->constrainSubjects(
+            $query,
+            (string) $identity['userId'],
+            'ai_notebook_chat_sessions.subject_id'
+        );
         $subjectId = (string) $request->query('subjectId', '');
         if ($subjectId !== '') {
             $this->ensureSubjectAccessible($request, $subjectId);
@@ -359,6 +355,7 @@ class AiNotebookController
         $userQuestion = (string) $input['userQuestion'];
         $answer = (string) $input['answer'];
         $storedAnswer = $answer;
+        $this->ensureSubjectAccessible($request, $subjectId);
         if (($input['studyAid']['type'] ?? null) === 'mind_map') {
             $storedAnswer .= "\n\n<!--nexus-study-aid:".base64_encode(json_encode($input['studyAid'], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE)).'-->';
         }
@@ -1402,6 +1399,9 @@ class AiNotebookController
                 ->where('user_id', $identity['userId'])
                 ->exists()) {
             throw new AccessDeniedHttpException('You do not have access to this subject.');
+        }
+        if (($identity['role'] ?? null) === 'admin') {
+            $this->subjectAccess->assertSubjectAccessible((string) $identity['userId'], $subjectId);
         }
     }
 }

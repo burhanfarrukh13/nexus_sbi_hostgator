@@ -6,6 +6,10 @@ const TOKEN_KEY = "nexus.accessToken";
 const REFRESH_TOKEN_KEY = "nexus.refreshToken";
 const REFRESH_USER_KEY = "nexus.refreshUserId";
 const REFRESH_LOCK_KEY = "nexus.refreshLock";
+const ADMIN_TOKEN_KEY = "nexus.admin.accessToken";
+const ADMIN_REFRESH_TOKEN_KEY = "nexus.admin.refreshToken";
+const ADMIN_REFRESH_USER_KEY = "nexus.admin.refreshUserId";
+const ADMIN_REFRESH_LOCK_KEY = "nexus.admin.refreshLock";
 const pendingGets = new Map<string, Promise<unknown>>();
 const etags = new Map<string, string>();
 const etagBodies = new Map<string, unknown>();
@@ -14,7 +18,23 @@ let refreshFlight: Promise<boolean> | null = null;
 let refreshTimer: number | undefined;
 
 export const getToken = () => {
-  const token = localStorage.getItem(TOKEN_KEY);
+  let token = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+  if (!token) {
+    const legacy = localStorage.getItem(TOKEN_KEY);
+    if (legacy && tokenRole(legacy) === "admin") {
+      sessionStorage.setItem(ADMIN_TOKEN_KEY, legacy);
+      const refresh = localStorage.getItem(REFRESH_TOKEN_KEY);
+      const userId = localStorage.getItem(REFRESH_USER_KEY);
+      if (refresh) sessionStorage.setItem(ADMIN_REFRESH_TOKEN_KEY, refresh);
+      if (userId) sessionStorage.setItem(ADMIN_REFRESH_USER_KEY, userId);
+      localStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(REFRESH_TOKEN_KEY);
+      localStorage.removeItem(REFRESH_USER_KEY);
+      token = legacy;
+    } else {
+      token = legacy;
+    }
+  }
   if (token !== observedToken) {
     observedToken = token;
     pendingGets.clear();
@@ -32,8 +52,15 @@ export const setToken = (token: string | null) => {
     etags.clear();
     etagBodies.clear();
   }
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else {
+  if (token && tokenRole(token) === "admin") {
+    sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+  } else if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
+  } else if (tokenRole(observedToken ?? "") === "admin" || sessionStorage.getItem(ADMIN_TOKEN_KEY)) {
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+    sessionStorage.removeItem(ADMIN_REFRESH_TOKEN_KEY);
+    sessionStorage.removeItem(ADMIN_REFRESH_USER_KEY);
+  } else {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(REFRESH_TOKEN_KEY);
     localStorage.removeItem(REFRESH_USER_KEY);
@@ -48,9 +75,28 @@ export function setSessionTokens(
   refreshToken: string,
   userId: string,
 ) {
-  localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-  localStorage.setItem(REFRESH_USER_KEY, userId);
+  // A tab can hold only one identity. Keep admin credentials in sessionStorage
+  // so closing this tab ends the administrator session without changing
+  // persistent, multi-tab student sessions.
+  sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  sessionStorage.removeItem(ADMIN_REFRESH_TOKEN_KEY);
+  sessionStorage.removeItem(ADMIN_REFRESH_USER_KEY);
+  const store = tokenRole(accessToken) === "admin" ? sessionStorage : localStorage;
+  store.setItem(tokenRole(accessToken) === "admin" ? ADMIN_REFRESH_TOKEN_KEY : REFRESH_TOKEN_KEY, refreshToken);
+  store.setItem(tokenRole(accessToken) === "admin" ? ADMIN_REFRESH_USER_KEY : REFRESH_USER_KEY, userId);
   setToken(accessToken);
+}
+
+function tokenRole(token: string): string | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const claims = JSON.parse(atob(normalized)) as { role?: unknown };
+    return typeof claims.role === "string" ? claims.role : null;
+  } catch {
+    return null;
+  }
 }
 
 function decodeExpiry(token: string): number | null {
@@ -115,23 +161,27 @@ function retryAfterMs(response: Response): number {
   return Number.isNaN(date) ? 30_000 : Math.max(1_000, date - Date.now());
 }
 
-async function withRefreshLock<T>(callback: () => Promise<T>): Promise<T | null> {
+async function withRefreshLock<T>(
+  callback: () => Promise<T>,
+  store: Storage = localStorage,
+  lockKey = REFRESH_LOCK_KEY,
+): Promise<T | null> {
   if (navigator.locks?.request) {
     return navigator.locks.request("nexus-access-token-refresh", callback);
   }
   const lockOwner = `${Date.now()}-${Math.random()}`;
   const lockUntil = Date.now() + 15_000;
-  const existing = localStorage.getItem(REFRESH_LOCK_KEY);
+  const existing = store.getItem(lockKey);
   if (existing) {
     const [, expires = "0"] = existing.split(":");
     if (Number(expires) > Date.now()) return null;
   }
-  localStorage.setItem(REFRESH_LOCK_KEY, `${lockOwner}:${lockUntil}`);
+  store.setItem(lockKey, `${lockOwner}:${lockUntil}`);
   try {
     return await callback();
   } finally {
-    if (localStorage.getItem(REFRESH_LOCK_KEY)?.startsWith(`${lockOwner}:`)) {
-      localStorage.removeItem(REFRESH_LOCK_KEY);
+    if (store.getItem(lockKey)?.startsWith(`${lockOwner}:`)) {
+      store.removeItem(lockKey);
     }
   }
 }
@@ -139,13 +189,20 @@ async function withRefreshLock<T>(callback: () => Promise<T>): Promise<T | null>
 async function refreshSession(): Promise<boolean> {
   if (refreshFlight) return refreshFlight;
   refreshFlight = (async () => {
-    const previousAccessToken = localStorage.getItem(TOKEN_KEY);
-    const refreshToken = localStorage.getItem(REFRESH_TOKEN_KEY);
-    const userId = localStorage.getItem(REFRESH_USER_KEY);
+    const previousAccessToken = getToken();
+    if (!previousAccessToken) return false;
+    const isAdminSession = tokenRole(previousAccessToken) === "admin";
+    const store = isAdminSession ? sessionStorage : localStorage;
+    const accessKey = isAdminSession ? ADMIN_TOKEN_KEY : TOKEN_KEY;
+    const refreshKey = isAdminSession ? ADMIN_REFRESH_TOKEN_KEY : REFRESH_TOKEN_KEY;
+    const userKey = isAdminSession ? ADMIN_REFRESH_USER_KEY : REFRESH_USER_KEY;
+    const lockKey = isAdminSession ? ADMIN_REFRESH_LOCK_KEY : REFRESH_LOCK_KEY;
+    const refreshToken = store.getItem(refreshKey);
+    const userId = store.getItem(userKey);
     if (!previousAccessToken || !refreshToken || !userId) return false;
 
     const result = await withRefreshLock(async () => {
-      const currentAccessToken = localStorage.getItem(TOKEN_KEY);
+      const currentAccessToken = store.getItem(accessKey);
       if (currentAccessToken !== previousAccessToken) return true;
       const send = () =>
         fetch(`${API_BASE}/api/auth/refresh`, {
@@ -178,8 +235,8 @@ async function refreshSession(): Promise<boolean> {
       if (!body.accessToken || !body.refreshToken || !body.user?.id) return false;
       setSessionTokens(body.accessToken, body.refreshToken, body.user.id);
       return true;
-    });
-    return result ?? localStorage.getItem(TOKEN_KEY) !== previousAccessToken;
+    }, store, lockKey);
+    return result ?? getToken() !== previousAccessToken;
   })().finally(() => {
     refreshFlight = null;
   });
@@ -308,7 +365,11 @@ export function label(value: unknown, fallback = "—"): string {
 }
 
 window.addEventListener("storage", (event) => {
-  if (event.key === TOKEN_KEY && event.newValue !== observedToken) {
+  if (
+    event.key === TOKEN_KEY &&
+    !sessionStorage.getItem(ADMIN_TOKEN_KEY) &&
+    event.newValue !== observedToken
+  ) {
     observedToken = event.newValue;
     pendingGets.clear();
     etags.clear();

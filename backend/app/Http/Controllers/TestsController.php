@@ -9,6 +9,7 @@ use App\Services\TestAuthoringService;
 use App\Services\TestAssessmentService;
 use App\Services\TestStudentAccessService;
 use App\Services\TestSubmissionService;
+use App\Services\SubjectAccessService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Http\Request;
@@ -31,7 +32,8 @@ class TestsController
         private readonly TestAssessmentService $assessment,
         private readonly QuestionPreviewService $preview,
         private readonly TestStudentAccessService $studentAccess,
-        private readonly TestSubmissionService $submissions
+        private readonly TestSubmissionService $submissions,
+        private readonly SubjectAccessService $subjectAccess
     ) {
     }
 
@@ -139,6 +141,7 @@ class TestsController
 
     public function storeSourceFiles(Request $request, string $testId, PrivateFileStorage $storage): JsonResponse
     {
+        $this->assertManageableTest($testId, $request);
         if (!Str::isUuid($testId) || !DB::table('tests')->where('id', $testId)->exists()) {
             return response()->json(['message' => 'Test not found.'], 404);
         }
@@ -209,6 +212,7 @@ class TestsController
 
     public function downloadSourceFile(string $testId, string $fileId, PrivateFileStorage $storage): JsonResponse|StreamedResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_source_files')
             ->where('test_id', $testId)
             ->where('id', $fileId)
@@ -241,18 +245,21 @@ class TestsController
 
     public function sourceFilePageInfo(string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
         return $this->pageInfoResponse($file, $storage, $renderer);
     }
 
     public function sourceFilePage(string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_source_files')->where('test_id', $testId)->where('id', $fileId)->first();
         return $this->pageResponse($file, $pageNumber, $storage, $renderer);
     }
 
     public function attemptFilePageInfo(string $testId, string $fileId, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_attempt_files as file')
             ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
             ->where('attempt.testId', $testId)
@@ -263,6 +270,7 @@ class TestsController
 
     public function attemptFilePage(string $testId, string $fileId, string $pageNumber, PrivateFileStorage $storage, DocumentPageRenderer $renderer): \Illuminate\Http\Response|JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_attempt_files as file')
             ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
             ->where('attempt.testId', $testId)
@@ -297,23 +305,69 @@ class TestsController
         return $this->pageResponse($file, $pageNumber, $storage, $renderer);
     }
 
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
         if (!Schema::hasTable('tests')) {
             return response()->json([]);
         }
 
-        return response()->json($this->tests->listAll());
+        $tests = $this->tests->listAll();
+        $subjectIds = $this->subjectAccess->allowedSubjectIds(
+            (string) $request->attributes->get('apiIdentity')['userId']
+        );
+        if ($subjectIds !== null) {
+            $tests = array_values(array_filter($tests, static fn (array $test): bool =>
+                in_array((string) ($test['subjectId'] ?? ''), $subjectIds, true)
+            ));
+        }
+
+        return response()->json($tests);
     }
 
     public function store(Request $request): JsonResponse
     {
         $input = $this->validateBody($request);
+        $this->subjectAccess->assertSubjectAccessible(
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            (string) $input['subjectId']
+        );
 
         return response()->json(
             $this->tests->create($input, (string) $request->attributes->get('apiIdentity')['userId']),
             201
         );
+    }
+
+    public function updateTitle(Request $request, string $testId): JsonResponse
+    {
+        $this->assertManageableTest($testId, $request);
+        $input = $request->validate([
+            'title' => ['required', 'string', 'min:1', 'max:200'],
+        ]);
+        if (trim($input['title']) === '') {
+            throw new BadRequestHttpException('The test title cannot be blank.');
+        }
+
+        return response()->json($this->tests->updateTitle(
+            $testId,
+            $input['title'],
+            (string) $request->attributes->get('apiIdentity')['userId']
+        ));
+    }
+
+    public function destroy(Request $request, string $testId, PrivateFileStorage $storage): JsonResponse
+    {
+        $this->assertManageableTest($testId, $request);
+        $input = $request->validate([
+            'mode' => ['required', 'in:archive,permanent'],
+        ]);
+        $actorId = (string) $request->attributes->get('apiIdentity')['userId'];
+
+        if ($input['mode'] === 'archive') {
+            return response()->json($this->tests->archive($testId, $actorId));
+        }
+
+        return response()->json($this->tests->permanentlyDelete($testId, $actorId, $storage));
     }
 
     public function previewQuestions(Request $request): JsonResponse
@@ -326,7 +380,7 @@ class TestsController
         return response()->json($this->preview->preview($files), 201);
     }
 
-    public function accessRequests(): JsonResponse
+    public function accessRequests(Request $request): JsonResponse
     {
         if (!Schema::hasTable('tests') || !Schema::hasTable('test_attempts')) {
             return response()->json([]);
@@ -335,9 +389,16 @@ class TestsController
         $requests = DB::table('test_attempts as attempt')
             ->join('tests as test', 'test.id', '=', 'attempt.testId')
             ->join('users as student', 'student.id', '=', 'attempt.studentId')
+            ->whereNull('test.archived_at')
             ->whereNotNull('attempt.access_requested_at')
             ->where('attempt.status', 'REQUESTED')
-            ->orderBy('attempt.access_requested_at')
+            ->orderBy('attempt.access_requested_at');
+        $this->subjectAccess->constrainSubjects(
+            $requests,
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            'test.subject_id'
+        );
+        $requests = $requests
             ->get([
                 'attempt.id as attemptId',
                 'attempt.testId',
@@ -374,9 +435,12 @@ class TestsController
 
         $test = DB::table('tests')->where('id', $testId)->first();
         $student = DB::table('users')->where('id', $studentId)->where('role', 'student')->first();
-        if (!$test || !$student) {
+        if (!$test || !$student || $test->archived_at !== null) {
             return response()->json(['message' => 'Test or student not found.'], 404);
         }
+        $identity = $request->attributes->get('apiIdentity');
+        $this->subjectAccess->assertTestAccessible((string) $identity['userId'], $testId);
+        $this->subjectAccess->assertStudentAccessible((string) $identity['userId'], $studentId);
         if (!DB::table('subject_user_access')
             ->where('subject_id', $test->subject_id)
             ->where('user_id', $studentId)
@@ -464,17 +528,20 @@ class TestsController
 
     public function attempts(string $testId): JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         return response()->json($this->assessment->listAttempts($testId));
     }
 
     public function retryAssessment(string $testId, string $attemptId): JsonResponse
     {
+        $this->assertManageableTest($testId, request());
         // Queue the submission; the background grading worker picks it up.
         return response()->json($this->assessment->requeueAttempt($testId, $attemptId));
     }
 
     public function downloadAttemptFile(string $testId, string $fileId, PrivateFileStorage $storage): JsonResponse|StreamedResponse
     {
+        $this->assertManageableTest($testId, request());
         $file = DB::table('test_attempt_files as file')
             ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
             ->where('attempt.testId', $testId)
@@ -514,6 +581,11 @@ class TestsController
 
     public function updateMarks(Request $request, string $testId, string $studentId): JsonResponse
     {
+        $this->assertManageableTest($testId, $request);
+        $this->subjectAccess->assertStudentAccessible(
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            $studentId
+        );
         $input = $request->validate([
             'marksObtained' => ['sometimes', 'numeric', 'decimal:0,2', 'min:0', 'max:10000'],
             'deficiencyNotes' => ['sometimes', 'nullable', 'string', 'max:4000'],
@@ -539,6 +611,18 @@ class TestsController
                 'sizeBytes' => (int) $file->size_bytes,
                 'createdAt' => $file->created_at,
             ])->all();
+    }
+
+    private function assertManageableTest(string $testId, Request $request): object
+    {
+        if (!Str::isUuid($testId)) {
+            throw new BadRequestHttpException('Invalid test identifier.');
+        }
+
+        return $this->subjectAccess->assertTestAccessible(
+            (string) $request->attributes->get('apiIdentity')['userId'],
+            $testId
+        );
     }
 
     private function pageInfoResponse(?object $file, PrivateFileStorage $storage, DocumentPageRenderer $renderer): JsonResponse
@@ -608,11 +692,21 @@ class TestsController
             ->where('attempt.testId', $testId)
             ->where('attempt.studentId', $identity['userId'] ?? '')
             ->where('file.id', $fileId)
-            ->first(['file.*', 'test.subject_id']);
+            ->first([
+                'file.*',
+                'test.subject_id',
+                'test.archived_at',
+                'attempt.submitted_at',
+                'attempt.status as attempt_status',
+            ]);
         if (!$file || !DB::table('subject_user_access')
             ->where('user_id', $identity['userId'] ?? '')
             ->where('subject_id', $file->subject_id)
             ->exists()) {
+            return null;
+        }
+        if ($file->archived_at !== null && $file->submitted_at === null &&
+            !in_array($file->attempt_status, ['SUBMITTED', 'PROCESSING', 'COMPLETED', 'FAILED'], true)) {
             return null;
         }
 
@@ -634,7 +728,9 @@ class TestsController
             ->where('testId', $testId)
             ->where('studentId', $identity['userId'])
             ->first();
-        if (!$attempt || $attempt->status !== 'COMPLETED' || $attempt->marksObtained === null ||
+        if (!$attempt || ($test->archived_at !== null && $attempt->submitted_at === null &&
+                !in_array($attempt->status, ['SUBMITTED', 'PROCESSING', 'COMPLETED', 'FAILED'], true)) ||
+            $attempt->status !== 'COMPLETED' || $attempt->marksObtained === null ||
             ($attempt->result_available_at !== null && Carbon::parse($attempt->result_available_at)->isFuture())) {
             throw new AccessDeniedHttpException('Source pages are available after results are released.');
         }

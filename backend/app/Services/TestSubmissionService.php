@@ -115,6 +115,18 @@ class TestSubmissionService
         $oldKeys = [];
         try {
             $result = DB::transaction(function () use ($test, $studentId, $questions, $answerMap, $answerTexts, $prepared, $completePaper, $clientSubmissionId, &$storedKeys, &$oldKeys): array {
+                $currentTest = DB::table('tests')
+                    ->where('id', $test->id)
+                    ->lockForUpdate()
+                    ->first();
+                if (!$currentTest) {
+                    throw new NotFoundHttpException('Test not found.');
+                }
+                if ($currentTest->archived_at !== null) {
+                    throw new BadRequestHttpException('This test is archived and no longer accepts submissions.');
+                }
+                $test = $currentTest;
+
                 $now = now();
                 DB::table('test_attempts')->insertOrIgnore([
                     'id' => (string) Str::uuid(),
@@ -399,6 +411,9 @@ class TestSubmissionService
             ->where('subject_id', $test->subject_id)
             ->exists()) {
             throw new AccessDeniedHttpException('You do not have access to this test subject.');
+        }
+        if ($test->archived_at !== null) {
+            throw new BadRequestHttpException('This test is archived and no longer accepts submissions.');
         }
 
         return $test;

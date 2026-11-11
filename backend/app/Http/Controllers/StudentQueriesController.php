@@ -20,7 +20,7 @@ class StudentQueriesController
         if ($identity['role'] === 'admin') {
             $this->assertCanManage($identity['adminPermissions'] ?? []);
 
-            return response()->json($this->queries->listAll());
+            return response()->json($this->queries->listAll((string) $identity['userId']));
         }
 
         return response()->json($this->queries->listForUser((string) $identity['userId']));

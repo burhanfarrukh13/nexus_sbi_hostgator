@@ -43,6 +43,10 @@ Route::middleware(['auth.compat', 'throttle:authenticated-api'])->prefix('team-m
         ->middleware('permission.compat:admin');
     Route::post('', [TeamMembersController::class, 'store'])
         ->middleware('permission.compat:admin');
+    Route::put('/{userId}', [TeamMembersController::class, 'update'])
+        ->middleware('permission.compat:admin');
+    Route::delete('/{userId}', [TeamMembersController::class, 'destroy'])
+        ->middleware('permission.compat:admin');
     Route::put('/{userId}/permissions', [TeamMembersController::class, 'updatePermissions'])
         ->middleware('permission.compat:admin');
     Route::put('/{userId}/password', [TeamMembersController::class, 'changePassword'])
@@ -147,5 +151,7 @@ Route::middleware(['auth.compat', 'throttle:authenticated-api', 'permission.comp
         Route::get('', [TestsController::class, 'index']);
         Route::post('/questions/preview', [TestsController::class, 'previewQuestions']);
         Route::post('', [TestsController::class, 'store']);
+        Route::put('/{testId}', [TestsController::class, 'updateTitle']);
+        Route::delete('/{testId}', [TestsController::class, 'destroy']);
         Route::post('/{testId}/source-files', [TestsController::class, 'storeSourceFiles']);
     });

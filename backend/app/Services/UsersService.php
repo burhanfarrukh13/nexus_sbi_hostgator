@@ -14,29 +14,48 @@ class UsersService
 {
     private const INITIAL_STUDENT_PASSWORD = 'abc@123';
 
-    public function findByEmailPublic(string $email, ?string $role): ?array
+    public function __construct(private readonly SubjectAccessService $subjectAccess)
+    {
+    }
+
+    public function findByEmailPublic(string $email, ?string $role, ?string $adminId = null): ?array
     {
         $query = DB::table('users')
             ->whereRaw('LOWER(email) = ?', [mb_strtolower(trim($email))]);
         if ($role !== null) {
             $query->where('role', $role);
         }
+        if ($adminId !== null) {
+            $this->subjectAccess->constrainStudents($query, $adminId);
+        }
         $user = $query->first(['id', 'email', 'role', 'studentId', 'fullName', 'phone']);
 
         return $user ? $this->basicUser($user) : null;
     }
 
-    public function listUsers(?string $role): array
+    public function listUsers(?string $role, ?string $adminId = null): array
     {
         $query = DB::table('users');
         if ($role !== null) {
             $query->where('role', $role);
         }
+        if ($adminId !== null) {
+            $this->subjectAccess->constrainStudents($query, $adminId);
+        }
 
         $users = $query->get(['id', 'email', 'role', 'studentId', 'fullName', 'phone']);
         $accessByUser = DB::table('subject_user_access')
-            ->whereIn('user_id', $users->pluck('id'))
-            ->get(['user_id', 'subject_id'])
+            ->whereIn('subject_user_access.user_id', $users->pluck('id'))
+            ->when(
+                $adminId !== null && $this->subjectAccess->isScopedTeamMember($adminId),
+                static fn ($query) => $query->join(
+                    'team_member_subject_access',
+                    'team_member_subject_access.subject_id',
+                    '=',
+                    'subject_user_access.subject_id'
+                )->where('team_member_subject_access.user_id', $adminId)
+            )
+            ->get(['subject_user_access.user_id as user_id', 'subject_user_access.subject_id as subject_id'])
             ->groupBy('user_id');
 
         return $users
@@ -106,7 +125,12 @@ class UsersService
         });
     }
 
-    public function updateStudentSubjects(string $userId, array $subjectIds, string $actorId): array
+    public function updateStudentSubjects(
+        string $userId,
+        array $subjectIds,
+        string $actorId,
+        ?array $manageableSubjectIds = null
+    ): array
     {
         $student = DB::table('users')->where('id', $userId)->where('role', 'student')->first();
         if (!$student) {
@@ -114,10 +138,16 @@ class UsersService
         }
 
         $subjectIds = array_values(array_unique($subjectIds));
+        $existingSubjectIds = DB::table('subject_user_access')
+            ->where('user_id', $userId)->pluck('subject_id')->all();
+        $retainedSubjectIds = $manageableSubjectIds === null
+            ? []
+            : array_values(array_diff($existingSubjectIds, $manageableSubjectIds));
+        $storedSubjectIds = array_values(array_unique([...$retainedSubjectIds, ...$subjectIds]));
         $now = now();
-        DB::transaction(function () use ($userId, $subjectIds, $actorId, $now): void {
+        DB::transaction(function () use ($userId, $subjectIds, $storedSubjectIds, $actorId, $now): void {
             DB::table('subject_user_access')->where('user_id', $userId)->delete();
-            foreach ($subjectIds as $subjectId) {
+            foreach ($storedSubjectIds as $subjectId) {
                 DB::table('subject_user_access')->insert([
                     'subject_id' => $subjectId,
                     'user_id' => $userId,
@@ -132,16 +162,18 @@ class UsersService
                 'userId' => $actorId,
                 'metadata' => json_encode([
                     'studentId' => $userId,
-                    'subjectIds' => $subjectIds,
+                    'subjectIds' => $storedSubjectIds,
                 ], JSON_THROW_ON_ERROR),
                 'createdAt' => $now,
             ]);
         });
 
-        return $this->basicUser($student) + ['subjectIds' => $subjectIds];
+        return $this->basicUser($student) + [
+            'subjectIds' => $manageableSubjectIds === null ? $storedSubjectIds : $subjectIds,
+        ];
     }
 
-    public function searchByEmail(string $fragment, int $limit = 25, ?string $role = null): array
+    public function searchByEmail(string $fragment, int $limit = 25, ?string $role = null, ?string $adminId = null): array
     {
         $safe = mb_strtolower(trim($fragment));
         if (mb_strlen($safe) < 2) {
@@ -152,6 +184,9 @@ class UsersService
             ->whereRaw('LOWER(email) LIKE ?', ['%'.$safe.'%']);
         if ($role !== null) {
             $query->where('users.role', $role);
+        }
+        if ($adminId !== null) {
+            $this->subjectAccess->constrainStudents($query, $adminId);
         }
 
         return $query->orderBy('users.email')

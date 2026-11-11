@@ -12,17 +12,21 @@ All authenticated routes use the bearer access token returned by login. Admin pe
 | `POST /api/auth/refresh` | Rotate refresh credentials. |
 | `POST /api/auth/signout` | Revoke the current session. |
 | `GET /api/auth/me` | Return the authenticated identity. |
-| `POST /api/auth/change-password` | Change the current user's password. |
+| `POST /api/auth/change-password` | Set the current user's new password (`newPassword` only); invalidates current sessions. |
 | `GET/POST /api/team-members` | List or create admin team members; super-admin only. |
-| `PUT /api/team-members/{userId}/permissions` | Replace a team member's supported permissions. |
+| `PUT /api/team-members/{userId}/permissions` | Replace a team member's supported permissions and optional `subjectIds` scope atomically. |
 | `PUT /api/team-members/{userId}/password` | Reset an eligible account password. |
 | `GET/POST /api/users` | List/search or create user accounts with role-based scope. Student creation accepts `fullName`, `email`, `phone`, `crn`, and optional `subjectIds`; the server assigns the requested initial password and never returns it. |
 | `GET /api/users/search?email=...` | Search accounts by email fragment. |
 | `PUT /api/users/{userId}/subjects` | Replace a student's subject grants (`subjectIds`); admin or `user_manager`. |
 
-Admins and `user_manager` users can use **Students** to create student accounts and **Users** to manage subject grants. Student creation collects full name, email, phone, CRN, and optional subject grants. CRN is stored in the existing `users.studentId` field. Every newly created student receives the exact initial password `abc@123` and must change it at first login; the API blocks other authenticated routes until that change is complete. Changed passwords must be at least 12 characters.
+Admins and `user_manager` users can use **Students** to create student accounts and **Users** to manage subject grants. Student creation collects full name, email, phone, CRN, and optional subject grants. CRN is stored in the existing `users.studentId` field. Every newly created student receives the exact initial password `abc@123` and must change it at first login; the API blocks other authenticated routes until that change is complete. Users may change their own password by supplying only a new password of at least 12 characters. Password changes are audited and revoke all active sessions.
 
 Existing databases must add `subject_user_access` by importing [`../database-updates/student-subject-access.sql`](../database-updates/student-subject-access.sql) after selecting the target database. New students can be granted subjects during creation; existing students receive access only after an administrator assigns subjects in **Users**. If an old database still has folder workflow tables, remove them with [`../database-updates/remove-legacy-folder-workflow.sql`](../database-updates/remove-legacy-folder-workflow.sql) only after backing up and confirming that their data is no longer needed. Do not import the destructive `database.sql` into a database that contains records.
+
+Existing databases must also apply [`../database-updates/team-member-subject-access.sql`](../database-updates/team-member-subject-access.sql) once (phpMyAdmin: select the app database, choose **Import**, select the file, and execute). This additive update creates only `team_member_subject_access`; the student-facing `subject_user_access` table is unchanged. Existing team members with no rows in the new table keep their prior unrestricted subject access. Team members with one or more scope rows are limited server-side to those subjects for student discovery, analytics, tests, marks, attempts, access requests, student queries, and Notebook data. Only a super-admin can manage team subject scopes. Subject deletion now permanently removes dependent tests, attempts, Notebook records, grants, tickets, and their owned private files; the delete audit record is retained. The per-user daily Notebook usage counter has no subject key, so it remains intact when one subject is deleted; subject-specific ticket reservations are deleted with their tickets.
+
+Admin access and refresh credentials are kept in the current tab's `sessionStorage` and are cleared when that tab closes. Existing student credentials remain in `localStorage`, including the shared refresh lock and automatic cross-tab refresh behavior.
 
 Supported admin permissions: `admin`, `teacher_assistant`, `user_manager`, `password_manager`, `testing_manager`, and `student_query`.
 
@@ -45,7 +49,7 @@ Subjects are standalone records used to group tests and notebook content; they d
 | `GET /api/subjects/list` | List standalone subjects. |
 | `POST /api/subjects` | Create a subject (`code`, `name`); requires `teacher_assistant` or `admin`. |
 | `PUT /api/subjects/{id}` | Update a subject's code/name. |
-| `DELETE /api/subjects/{id}` | Delete only if no tests or notebook activity references it. |
+| `DELETE /api/subjects/{id}` | Permanently delete the subject, all dependent test/Notebook activity, and owned private files. |
 | `GET /api/ai-notebook/subjects` | List subjects for notebook selection. |
 | `GET /api/ai-notebook/subjects/{subjectId}/sources` | List sources for the subject. |
 | `POST /api/ai-notebook/sources` | Multipart upload with `file`, `subjectId`, and optional `title`; teacher assistant/admin. |
@@ -77,6 +81,8 @@ Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollam
 |---|---|
 | `GET /api/tests` | List tests; teacher assistant/admin. |
 | `POST /api/tests` | Create a test using `subjectId`, title, deadline, total marks, and question/marking data; teacher assistant/admin. |
+| `PUT /api/tests/{testId}` | Update a test title; teacher assistant/admin, restricted to accessible subjects. |
+| `DELETE /api/tests/{testId}` | Archive with `mode: "archive"` or permanently remove the test, attempts/reports, and private files with `mode: "permanent"`; teacher assistant/admin, restricted to accessible subjects. |
 | `POST /api/tests/questions/preview` | Parse uploaded question source files for authoring review. |
 | `POST /api/tests/{testId}/source-files` | Retain uploaded source PDFs/DOCX in private storage after test creation; teacher assistant/admin. |
 | `GET /api/tests/{testId}/source-files/{fileId}` | Download an original test source file; teacher assistant, testing manager, or admin. |
@@ -99,7 +105,7 @@ Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollam
 | `GET/PUT /api/tests/ai-grading-settings` | Read/update the Notebook daily question limit, AI feedback prompt, and result-release delay (0–720 hours); admin permission only. |
 | `GET /api/tests/grading-queue`, `POST /api/tests/grading-queue/retry` | Read queue operational details or retry blocked submissions; admin permission only. |
 
-Tests and attempts reference `users` directly. Tests are grouped by `subjects`; no folder permissions or school-roster tables are used. Results are immediately visible by default to match the original workflow; administrators may intentionally configure a 0–720 hour release delay. A grading failure moves the saved attempt to `FAILED` so the student can resubmit or an administrator can retry. The `ai-tests:grade-pending` command (cPanel cron every 15 minutes) grades queued submissions and first returns `PROCESSING` attempts stuck longer than `GRADING_STALE_MINUTES` (45 by default) to the queue; attempts still waiting in `SUBMITTED` are never failed. PDFs are text-extracted and rendered server-side when Imagick or `pdftoppm` is available; browser conversion remains an optimization. Source and answer page endpoints return `{pageCount}` and `image/*` page bytes. Review resolution requires a prior student review request.
+Tests and attempts reference `users` directly. Tests are grouped by `subjects`; no folder permissions or school-roster tables are used. Archiving sets `tests.archived_at`, blocks new/current student access and submissions, and leaves attempted reports available in student history and admin review. Permanent deletion cascades test attempts/reports and metadata, and deletes related private source/submission files. Existing databases must apply [`../database-updates/test-lifecycle.sql`](../database-updates/test-lifecycle.sql) once before deploying these routes. Results are immediately visible by default to match the original workflow; administrators may intentionally configure a 0–720 hour release delay. A grading failure moves the saved attempt to `FAILED` so the student can resubmit or an administrator can retry. The `ai-tests:grade-pending` command (cPanel cron every 15 minutes) grades queued submissions and first returns `PROCESSING` attempts stuck longer than `GRADING_STALE_MINUTES` (45 by default) to the queue; attempts still waiting in `SUBMITTED` are never failed. PDFs are text-extracted and rendered server-side when Imagick or `pdftoppm` is available; browser conversion remains an optimization. Source and answer page endpoints return `{pageCount}` and `image/*` page bytes. Review resolution requires a prior student review request.
 
 `test_attempts` intentionally remains the one-row-per-student/test lifecycle record. Its status, submission, result, and optional review fields describe that same attempt; splitting them into one-to-one tables would add joins without normalizing repeated data. Uploaded files already live in `test_attempt_files`. Answers and assessment payloads remain JSON because the API stores and returns them as submission documents; a separate per-question answer table is only warranted if question-level reporting or querying becomes a requirement.
 

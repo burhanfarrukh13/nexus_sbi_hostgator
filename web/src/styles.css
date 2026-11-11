@@ -102,6 +102,70 @@ a {
 .nav-caption {
   padding: 6px 12px 10px;
 }
+.nav-customize-button {
+  margin: 0 8px 10px;
+  padding: 8px 10px;
+  border: 1px solid #dfe7f2;
+  border-radius: 8px;
+  background: #f8faff;
+  color: #53647d;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+}
+.nav-customize-button:hover,
+.nav-customize-button:focus-visible {
+  border-color: #9db8f5;
+  color: #215ede;
+}
+.nav-order-panel {
+  margin: 6px 4px 10px;
+  padding: 10px;
+  border: 1px solid #e5ebf4;
+  border-radius: 9px;
+  background: #f9fbfe;
+}
+.nav-order-panel > p {
+  margin: 0 0 8px;
+  color: #7c8aa0;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.nav-order-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  color: #41516a;
+  font-size: 11px;
+}
+.nav-order-row span {
+  flex: 1;
+}
+.nav-order-row button {
+  width: 25px;
+  height: 25px;
+  border: 1px solid #e0e7f0;
+  border-radius: 6px;
+  background: #fff;
+  color: #52647e;
+}
+.nav-order-row button:focus-visible,
+.nav-item:focus-visible {
+  outline: 2px solid #2463eb;
+  outline-offset: 2px;
+}
+.subject-edit-form {
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid #e7edf4;
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+.compact-actions {
+  margin-left: auto;
+  gap: 6px;
+}
 .sidebar nav {
   flex: 1 1 auto;
   min-height: 0;
@@ -632,6 +696,18 @@ a {
 .status.success {
   color: #248b63;
   background: #e9f7f0;
+}
+.status.archived-status {
+  color: #64748b;
+  background: #f1f3f6;
+}
+.lifecycle-modal > p {
+  color: #64748b;
+  line-height: 1.6;
+}
+.lifecycle-actions {
+  flex-wrap: wrap;
+  margin-top: 20px;
 }
 .row-date {
   color: #8491a4;
@@ -2073,7 +2149,48 @@ select:focus {
 }
 .compact-permissions {
   margin-top: 10px;
-  max-width: 420px;
+  width: 100%;
+  max-width: none;
+}
+.subject-scope-options {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px 18px;
+}
+.subject-scope-options .subject-scope-help,
+.subject-scope-options > .subtle-padding,
+.subject-scope-options > .alert {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.subject-scope-options label {
+  min-width: 0;
+  align-items: flex-start;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.subject-scope-options label input {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+.team-edit-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #e7edf4;
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+.team-edit-panel .compact-permissions {
+  margin-top: 0;
+}
+.danger-button {
+  color: #b42318;
+}
+.danger-button:hover {
+  border-color: #f0b4ae;
+  background: #fff7f6;
 }
 .small-button {
   margin: 4px 0;
@@ -2629,6 +2746,9 @@ select:focus {
   }
   .inline-fields {
     flex-direction: column;
+  }
+  .subject-scope-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .button-row {
     flex-wrap: wrap;

@@ -14,6 +14,10 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 class TeamMembersService
 {
+    public function __construct(private readonly SubjectAccessService $subjectAccess)
+    {
+    }
+
     private const WEB_PERMISSIONS = [
         'admin',
         'teacher_assistant',
@@ -47,9 +51,28 @@ class TeamMembersService
                 ->orderBy('permission')
                 ->pluck('permission')
                 ->all();
+            $user['subjectIds'] = DB::table('team_member_subject_access')
+                ->where('user_id', $member->id)
+                ->orderBy('subject_id')
+                ->pluck('subject_id')
+                ->all();
 
             return $user;
         })->all();
+    }
+
+    private function replaceSubjectAccess(string $userId, array $subjectIds, string $grantedByUserId): void
+    {
+        DB::table('team_member_subject_access')->where('user_id', $userId)->delete();
+        $now = now();
+        foreach (array_values(array_unique($subjectIds)) as $subjectId) {
+            DB::table('team_member_subject_access')->insert([
+                'user_id' => $userId,
+                'subject_id' => $subjectId,
+                'granted_by_user_id' => $grantedByUserId,
+                'created_at' => $now,
+            ]);
+        }
     }
 
     public function create(array $data, string $actorId): array
@@ -80,11 +103,12 @@ class TeamMembersService
                     'updatedAt' => now(),
                 ]);
                 $this->replacePermissions($id, $data['permissions']);
+                $this->replaceSubjectAccess($id, $data['subjectIds'] ?? [], $actorId);
                 $this->audit(
                     'team_member_created',
                     "Team member {$email} created",
                     $actorId,
-                    ['permissions' => $data['permissions'], 'actorId' => $actorId]
+                    ['permissions' => $data['permissions'], 'subjectIds' => $data['subjectIds'] ?? [], 'actorId' => $actorId]
                 );
             });
         } catch (\Illuminate\Database\QueryException $exception) {
@@ -98,6 +122,7 @@ class TeamMembersService
             'id' => $id,
             'email' => $email,
             'permissions' => $data['permissions'],
+            'subjectIds' => $data['subjectIds'] ?? [],
         ];
         if (array_key_exists('fullName', $data)) {
             $created['fullName'] = $data['fullName'];
@@ -109,7 +134,7 @@ class TeamMembersService
         return $created;
     }
 
-    public function updatePermissions(string $targetUserId, array $permissions, string $actorId): array
+    public function updatePermissions(string $targetUserId, array $permissions, string $actorId, ?array $subjectIds = null): array
     {
         if (!$this->callerCanManage($actorId)) {
             throw new BadRequestHttpException('Only super admins can change permissions');
@@ -120,18 +145,129 @@ class TeamMembersService
         }
         $this->validateWebPermissions($permissions);
 
-        DB::transaction(function () use ($targetUserId, $permissions, $actorId, $user): void {
+        DB::transaction(function () use ($targetUserId, $permissions, $actorId, $user, $subjectIds): void {
             $this->replacePermissions($targetUserId, $permissions);
+            if ($subjectIds !== null) {
+                $this->replaceSubjectAccess($targetUserId, $subjectIds, $actorId);
+            }
             $actor = $this->requireUser($actorId);
             $this->audit(
                 'team_member_permissions_changed',
                 "Permissions updated for {$user->email}",
                 $actor->id,
-                ['permissions' => $permissions, 'actorId' => $actorId]
+                [
+                    'permissions' => $permissions,
+                    'subjectIds' => $subjectIds ?? DB::table('team_member_subject_access')
+                        ->where('user_id', $targetUserId)->orderBy('subject_id')->pluck('subject_id')->all(),
+                    'actorId' => $actorId,
+                ]
             );
         });
 
-        return $this->userResponse($user);
+        $result = $this->userResponse($user);
+        $result['subjectIds'] = DB::table('team_member_subject_access')
+            ->where('user_id', $targetUserId)->orderBy('subject_id')->pluck('subject_id')->all();
+        return $result;
+    }
+
+    public function update(string $targetUserId, array $data, string $actorId): array
+    {
+        if (!$this->callerCanManage($actorId)) {
+            throw new AccessDeniedHttpException('Only super admins can edit team members.');
+        }
+        $user = $this->requireUser($targetUserId);
+        if ($user->role !== 'admin') {
+            throw new BadRequestHttpException('Only team member accounts can be edited here.');
+        }
+        $this->validateWebPermissions($data['permissions']);
+        $email = mb_strtolower(trim($data['email']));
+
+        if (DB::table('users')
+            ->whereRaw('LOWER(email) = ?', [$email])
+            ->where('id', '!=', $targetUserId)
+            ->exists()) {
+            throw new BadRequestHttpException('A user with that email already exists.');
+        }
+
+        try {
+            DB::transaction(function () use ($targetUserId, $data, $actorId, $email, $user): void {
+                DB::table('users')->where('id', $targetUserId)->update([
+                    'email' => $email,
+                    'fullName' => trim((string) ($data['fullName'] ?? '')) ?: null,
+                    'phone' => trim((string) ($data['phone'] ?? '')) ?: null,
+                    'updatedAt' => now(),
+                ]);
+                $this->replacePermissions($targetUserId, $data['permissions']);
+                $this->replaceSubjectAccess($targetUserId, $data['subjectIds'], $actorId);
+                $this->audit(
+                    'team_member_updated',
+                    "Team member {$user->email} updated",
+                    $actorId,
+                    [
+                        'targetUserId' => $targetUserId,
+                        'email' => $email,
+                        'permissions' => $data['permissions'],
+                        'subjectIds' => $data['subjectIds'],
+                    ]
+                );
+            });
+        } catch (\Illuminate\Database\QueryException $exception) {
+            if ((string) $exception->getCode() === '23000') {
+                throw new BadRequestHttpException('A user with that email already exists.');
+            }
+            throw $exception;
+        }
+
+        $updated = $this->requireUser($targetUserId);
+        $result = $this->userResponse($updated);
+        $result['permissions'] = $this->getPermissions($targetUserId);
+        $result['subjectIds'] = DB::table('team_member_subject_access')
+            ->where('user_id', $targetUserId)
+            ->orderBy('subject_id')
+            ->pluck('subject_id')
+            ->all();
+
+        return $result;
+    }
+
+    public function delete(string $targetUserId, string $actorId): void
+    {
+        if (!$this->callerCanManage($actorId)) {
+            throw new AccessDeniedHttpException('Only super admins can delete team members.');
+        }
+        if ($targetUserId === $actorId) {
+            throw new BadRequestHttpException('You cannot delete your own account.');
+        }
+        $target = $this->requireUser($targetUserId);
+        if ($target->role !== 'admin') {
+            throw new BadRequestHttpException('Only team member accounts can be deleted here.');
+        }
+        $isSuperAdmin = in_array('admin', $this->getPermissions($targetUserId), true);
+
+        DB::transaction(function () use ($targetUserId, $actorId, $target, $isSuperAdmin): void {
+            if ($isSuperAdmin) {
+                $superAdmins = DB::table('users')
+                    ->where('role', 'admin')
+                    ->whereExists(static function ($query): void {
+                        $query->selectRaw('1')
+                            ->from('user_role_assignments')
+                            ->whereColumn('user_role_assignments.userId', 'users.id')
+                            ->where('user_role_assignments.permission', 'admin');
+                    })
+                    ->lockForUpdate()
+                    ->pluck('users.id');
+                if ($superAdmins->count() <= 1) {
+                    throw new BadRequestHttpException('The last super admin cannot be deleted.');
+                }
+            }
+            $this->audit(
+                'team_member_deleted',
+                "Team member {$target->email} deleted",
+                $actorId,
+                ['targetUserId' => $targetUserId, 'email' => $target->email]
+            );
+            DB::table('users')->where('id', $targetUserId)->delete();
+        });
     }
 
     public function changePassword(string $targetUserId, array $data, string $actorId): array
@@ -149,6 +285,9 @@ class TeamMembersService
         }
         if ($user->role !== 'student' && !$isSuperAdmin) {
             throw new AccessDeniedHttpException('Password managers may reset student accounts only');
+        }
+        if ($user->role === 'student' && !$isSuperAdmin) {
+            $this->subjectAccess->assertStudentAccessible($actorId, $targetUserId);
         }
         if ($user->role !== 'student') {
             if (in_array('admin', $this->getPermissions($targetUserId), true)) {

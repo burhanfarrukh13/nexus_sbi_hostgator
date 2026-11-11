@@ -30,6 +30,8 @@ class TeamMembersController
             'phone' => ['sometimes', 'nullable', 'string', 'min:0', 'max:32'],
             'permissions' => ['required', 'array', 'max:12'],
             'permissions.*' => ['required', 'string', 'distinct', Rule::in($this->allowedPermissions())],
+            'subjectIds' => ['sometimes', 'array', 'max:100'],
+            'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
         ]);
         $this->validateAllowedPortalPermissions($input['permissions']);
 
@@ -39,19 +41,54 @@ class TeamMembersController
         );
     }
 
+    public function update(Request $request, string $userId): JsonResponse
+    {
+        $this->validateUuid($userId);
+        $input = $this->validateRequest($request, [
+            'email' => ['required', 'string', 'email', 'min:3', 'max:254', Rule::unique('users', 'email')->ignore($userId, 'id')],
+            'fullName' => ['sometimes', 'nullable', 'string', 'max:200'],
+            'phone' => ['sometimes', 'nullable', 'string', 'max:32'],
+            'permissions' => ['required', 'array', 'max:12'],
+            'permissions.*' => ['required', 'string', 'distinct', Rule::in($this->allowedPermissions())],
+            'subjectIds' => ['required', 'array', 'max:100'],
+            'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
+        ]);
+        $this->validateAllowedPortalPermissions($input['permissions']);
+
+        return response()->json($this->teamMembers->update(
+            $userId,
+            $input,
+            (string) $request->attributes->get('apiIdentity')['userId']
+        ));
+    }
+
+    public function destroy(Request $request, string $userId): JsonResponse
+    {
+        $this->validateUuid($userId);
+        $this->teamMembers->delete(
+            $userId,
+            (string) $request->attributes->get('apiIdentity')['userId']
+        );
+
+        return response()->json(['success' => true]);
+    }
+
     public function updatePermissions(Request $request, string $userId): JsonResponse
     {
         $this->validateUuid($userId);
         $input = $this->validateRequest($request, [
             'permissions' => ['present', 'array', 'max:12'],
             'permissions.*' => ['required', 'string', 'distinct', Rule::in($this->allowedPermissions())],
+            'subjectIds' => ['sometimes', 'array', 'max:100'],
+            'subjectIds.*' => ['required', 'uuid', 'distinct', Rule::exists('subjects', 'id')],
         ]);
         $this->validateAllowedPortalPermissions($input['permissions']);
 
         return response()->json($this->teamMembers->updatePermissions(
             $userId,
             $input['permissions'],
-            $request->attributes->get('apiIdentity')['userId']
+            $request->attributes->get('apiIdentity')['userId'],
+            $input['subjectIds'] ?? null
         ));
     }
 

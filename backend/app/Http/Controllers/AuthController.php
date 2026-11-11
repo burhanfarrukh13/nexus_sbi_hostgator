@@ -109,23 +109,32 @@ class AuthController
     public function changePassword(Request $request): JsonResponse
     {
         $input = $request->validate([
-            'currentPassword' => ['required', 'string', 'min:1', 'max:200'],
-            'newPassword' => ['required', 'string', 'min:12', 'max:200', 'different:currentPassword'],
+            'newPassword' => ['required', 'string', 'min:12', 'max:200'],
         ]);
         $identity = $request->attributes->get('apiIdentity');
         $user = DB::table('users')->where('id', $identity['userId'])->first();
-        if (!$user || !Hash::check($input['currentPassword'], $user->password)) {
-            throw new UnauthorizedHttpException('', 'Current password is incorrect');
+        if (!$user) {
+            throw new UnauthorizedHttpException('', 'Account not found');
         }
 
-        DB::table('users')->where('id', $user->id)->update([
-            'password' => Hash::make($input['newPassword']),
-            'must_reset_password' => false,
-            'refreshTokenHash' => null,
-            'previousRefreshTokenHash' => null,
-            'refreshCounter' => (int) $user->refreshCounter + 1,
-            'updatedAt' => now(),
-        ]);
+        DB::transaction(function () use ($input, $identity, $user): void {
+            DB::table('users')->where('id', $user->id)->update([
+                'password' => Hash::make($input['newPassword']),
+                'must_reset_password' => false,
+                'refreshTokenHash' => null,
+                'previousRefreshTokenHash' => null,
+                'refreshCounter' => (int) $user->refreshCounter + 1,
+                'updatedAt' => now(),
+            ]);
+            DB::table('audit_logs')->insert([
+                'id' => (string) \Illuminate\Support\Str::uuid(),
+                'event' => 'password_changed',
+                'details' => 'Account password changed',
+                'userId' => $identity['userId'],
+                'metadata' => json_encode(['actorId' => $identity['userId']], JSON_THROW_ON_ERROR),
+                'createdAt' => now(),
+            ]);
+        });
 
         return response()->json(['success' => true], 201);
     }

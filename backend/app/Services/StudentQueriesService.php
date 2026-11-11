@@ -9,6 +9,10 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 class StudentQueriesService
 {
+    public function __construct(private readonly SubjectAccessService $subjectAccess)
+    {
+    }
+
     public function create(string $userId, array $data): array
     {
         $id = (string) Str::uuid();
@@ -37,9 +41,12 @@ class StudentQueriesService
             ->all();
     }
 
-    public function listAll(): array
+    public function listAll(string $adminId): array
     {
-        return $this->query()
+        $query = $this->query();
+        $this->subjectAccess->constrainStudents($query, $adminId, 'user.id');
+
+        return $query
             ->orderByDesc('query.createdAt')
             ->get()
             ->map(fn (object $row): array => $this->format($row))
@@ -48,7 +55,9 @@ class StudentQueriesService
 
     public function reply(string $id, string $response, string $adminId): array
     {
-        if (!DB::table('student_queries')->where('id', $id)->exists()) {
+        $query = $this->query()->where('query.id', $id);
+        $this->subjectAccess->constrainStudents($query, $adminId, 'user.id');
+        if (!$query->exists()) {
             throw new NotFoundHttpException('Student query not found.');
         }
 
@@ -60,7 +69,7 @@ class StudentQueriesService
         ]);
         $this->audit('student_query_responded', $id, $adminId);
 
-        return $this->find($id);
+        return $this->find($id, $adminId);
     }
 
     private function query(): \Illuminate\Database\Query\Builder
@@ -87,9 +96,13 @@ class StudentQueriesService
             ]);
     }
 
-    private function find(string $id): array
+    private function find(string $id, ?string $adminId = null): array
     {
-        $row = $this->query()->where('query.id', $id)->first();
+        $query = $this->query()->where('query.id', $id);
+        if ($adminId !== null) {
+            $this->subjectAccess->constrainStudents($query, $adminId, 'user.id');
+        }
+        $row = $query->first();
         if (!$row) {
             throw new NotFoundHttpException('Student query not found.');
         }

@@ -38,7 +38,10 @@ class TestStudentAccessService
             ->get()
             ->keyBy('testId');
 
-        return $tests->map(function (object $test) use ($attempts): array {
+        return $tests->filter(function (object $test) use ($attempts): bool {
+            return $test->archived_at === null ||
+                $this->isHistoricalAttempt($attempts->get($test->id));
+        })->map(function (object $test) use ($attempts): array {
             $questions = $this->decodeJson($test->questions, []);
             $attempt = $attempts->get($test->id);
             $effectiveDeadline = $attempt->deadline_override_at ?? $test->deadline_at ?? null;
@@ -62,6 +65,7 @@ class TestStudentAccessService
                     'testDate' => $test->testDate,
                     'totalMarks' => (string) $test->totalMarks,
                     'deadlineAt' => $this->isoDate($test->deadline_at),
+                    'archivedAt' => $this->isoDate($test->archived_at),
                     'questions' => array_map(static fn (array $question): array => [
                         'questionNumber' => $question['questionNumber'] ?? null,
                         'questionText' => $question['questionText'] ?? null,
@@ -70,7 +74,7 @@ class TestStudentAccessService
                     'createdAt' => $this->isoDate($test->createdAt),
                 ],
             ];
-        })->all();
+        })->values()->all();
     }
 
     public function getTestForStudent(string $testId, string $studentId): array
@@ -131,6 +135,7 @@ class TestStudentAccessService
             'testDate' => $test->testDate,
             'totalMarks' => (string) $test->totalMarks,
             'deadlineAt' => $this->isoDate($test->deadline_at),
+            'archivedAt' => $this->isoDate($test->archived_at),
             'questions' => $studentQuestions,
             'lectures' => [],
             'attempt' => $this->studentAttemptView($attempt, $questions, $attemptFiles),
@@ -186,23 +191,24 @@ class TestStudentAccessService
 
     public function requestAccess(string $testId, string $studentId): array
     {
-        $test = $this->requireStudentTestAccess($testId, $studentId);
-        if (!DB::table('users')->where('id', $studentId)->exists()) {
-            throw new NotFoundHttpException('Student not found');
-        }
+        return DB::transaction(function () use ($testId, $studentId): array {
+            $test = $this->requireStudentTestAccess($testId, $studentId, true);
+            $this->assertTestIsActive($test);
+            if (!DB::table('users')->where('id', $studentId)->exists()) {
+                throw new NotFoundHttpException('Student not found');
+            }
 
-        $now = now();
-        DB::table('test_attempts')->insertOrIgnore([
-            'id' => (string) Str::uuid(),
-            'testId' => $test->id,
-            'studentId' => $studentId,
-            'appeared' => false,
-            'status' => 'NOT_ATTEMPTED',
-            'createdAt' => $now,
-            'updatedAt' => $now,
-        ]);
+            $now = now();
+            DB::table('test_attempts')->insertOrIgnore([
+                'id' => (string) Str::uuid(),
+                'testId' => $test->id,
+                'studentId' => $studentId,
+                'appeared' => false,
+                'status' => 'NOT_ATTEMPTED',
+                'createdAt' => $now,
+                'updatedAt' => $now,
+            ]);
 
-        return DB::transaction(function () use ($test, $studentId): array {
             $attempt = DB::table('test_attempts')
                 ->where('testId', $test->id)
                 ->where('studentId', $studentId)
@@ -243,7 +249,8 @@ class TestStudentAccessService
 
     public function submitReview(string $testId, string $studentId, string $note): array
     {
-        $this->requireStudentTestAccess($testId, $studentId);
+        $test = $this->requireStudentTestAccess($testId, $studentId);
+        $this->assertTestIsActive($test);
         $note = trim($note);
         if (mb_strlen($note) < 1 || mb_strlen($note) > 4000) {
             throw new BadRequestHttpException('A review note must contain between 1 and 4000 characters.');
@@ -281,13 +288,21 @@ class TestStudentAccessService
         });
     }
 
-    private function requireStudentTestAccess(string $testId, string $studentId): object
+    private function requireStudentTestAccess(
+        string $testId,
+        string $studentId,
+        bool $lockForUpdate = false
+    ): object
     {
         if (!Str::isUuid($testId)) {
             throw new BadRequestHttpException('Invalid identifier');
         }
 
-        $test = DB::table('tests')->where('id', $testId)->first();
+        $query = DB::table('tests')->where('id', $testId);
+        if ($lockForUpdate) {
+            $query->lockForUpdate();
+        }
+        $test = $query->first();
         if (!$test) {
             throw new NotFoundHttpException('Test not found');
         }
@@ -301,8 +316,32 @@ class TestStudentAccessService
             ->exists()) {
             throw new AccessDeniedHttpException('You do not have access to this test subject.');
         }
+        if ($test->archived_at !== null) {
+            $attempt = DB::table('test_attempts')
+                ->where('testId', $testId)
+                ->where('studentId', $studentId)
+                ->first(['submitted_at', 'status']);
+            if (!$this->isHistoricalAttempt($attempt)) {
+                throw new NotFoundHttpException('Test not found.');
+            }
+        }
 
         return $test;
+    }
+
+    private function assertTestIsActive(object $test): void
+    {
+        if ($test->archived_at !== null) {
+            throw new BadRequestHttpException('This test is archived and no longer accepts changes.');
+        }
+    }
+
+    private function isHistoricalAttempt(?object $attempt): bool
+    {
+        return $attempt !== null && (
+            $attempt->submitted_at !== null ||
+            in_array($attempt->status, ['SUBMITTED', 'PROCESSING', 'COMPLETED', 'FAILED'], true)
+        );
     }
 
     private function studentAttemptView(?object $attempt, array $questions, array $files = []): ?array

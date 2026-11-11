@@ -6,6 +6,7 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use App\Services\PrivateFileStorage;
 use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 use Symfony\Component\HttpKernel\Exception\BadRequestHttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
@@ -87,6 +88,118 @@ class TestAuthoringService
         ]);
 
         return $this->testView(DB::table('tests')->where('id', $id)->first());
+    }
+
+    public function updateTitle(string $testId, string $title, string $actorId): array
+    {
+        $this->assertCanManageTest($testId, $actorId);
+
+        DB::transaction(function () use ($testId, $title): void {
+            $test = DB::table('tests')->where('id', $testId)->lockForUpdate()->first();
+            if (!$test) {
+                throw new NotFoundHttpException('Test not found.');
+            }
+
+            DB::table('tests')->where('id', $testId)->update([
+                'title' => trim($title),
+                'updatedAt' => now(),
+            ]);
+        });
+
+        $this->recordLifecycleAudit($actorId, 'test_title_updated', "Test {$testId} title updated");
+
+        return $this->testView(DB::table('tests')->where('id', $testId)->first());
+    }
+
+    public function archive(string $testId, string $actorId): array
+    {
+        $this->assertCanManageTest($testId, $actorId);
+
+        DB::transaction(function () use ($testId): void {
+            $test = DB::table('tests')->where('id', $testId)->lockForUpdate()->first();
+            if (!$test) {
+                throw new NotFoundHttpException('Test not found.');
+            }
+
+            if ($test->archived_at === null) {
+                DB::table('tests')->where('id', $testId)->update([
+                    'archived_at' => now(),
+                    'updatedAt' => now(),
+                ]);
+            }
+        });
+
+        $this->recordLifecycleAudit($actorId, 'test_archived', "Test {$testId} archived");
+
+        return $this->testView(DB::table('tests')->where('id', $testId)->first());
+    }
+
+    public function permanentlyDelete(string $testId, string $actorId, PrivateFileStorage $storage): array
+    {
+        $this->assertCanManageTest($testId, $actorId);
+
+        DB::transaction(function () use ($testId, $actorId, $storage): void {
+            $test = DB::table('tests')->where('id', $testId)->lockForUpdate()->first();
+            if (!$test) {
+                throw new NotFoundHttpException('Test not found.');
+            }
+
+            $storageKeys = DB::table('test_source_files')
+                ->where('test_id', $testId)
+                ->whereNotNull('storage_key')
+                ->pluck('storage_key')
+                ->all();
+            $attemptStorageKeys = DB::table('test_attempt_files as file')
+                ->join('test_attempts as attempt', 'attempt.id', '=', 'file.attempt_id')
+                ->where('attempt.testId', $testId)
+                ->whereNotNull('file.storage_key')
+                ->pluck('file.storage_key')
+                ->all();
+
+            // Delete is idempotent for missing files. If any file cannot be
+            // removed, keep the database records so the operation can be retried.
+            foreach (array_unique([...$storageKeys, ...$attemptStorageKeys]) as $storageKey) {
+                if (is_string($storageKey) && $storageKey !== '') {
+                    $storage->delete($storageKey);
+                }
+            }
+
+            // The schema cascades attempt/report and file metadata rows from tests.
+            DB::table('tests')->where('id', $testId)->delete();
+            $this->recordLifecycleAudit($actorId, 'test_permanently_deleted', "Test {$testId} permanently deleted");
+        });
+
+        return ['ok' => true, 'id' => $testId, 'deleted' => true];
+    }
+
+    private function assertCanManageTest(string $testId, string $actorId): void
+    {
+        $actor = DB::table('users')->where('id', $actorId)->first();
+        if (!$actor) {
+            throw new NotFoundHttpException('Actor user not found.');
+        }
+
+        $permissions = DB::table('user_role_assignments')
+            ->where('userId', $actorId)
+            ->pluck('permission')
+            ->all();
+        if (!in_array('admin', $permissions, true) &&
+            !in_array('teacher_assistant', $permissions, true)) {
+            throw new AccessDeniedHttpException('Missing permission: teacher_assistant or admin');
+        }
+
+        app(SubjectAccessService::class)->assertTestAccessible($actorId, $testId);
+    }
+
+    private function recordLifecycleAudit(string $actorId, string $event, string $details): void
+    {
+        DB::table('audit_logs')->insert([
+            'id' => (string) Str::uuid(),
+            'event' => $event,
+            'details' => $details,
+            'userId' => $actorId,
+            'createdAt' => now(),
+        ]);
     }
 
     private function normalizeQuestions(array $questions): array
@@ -187,6 +300,7 @@ class TestAuthoringService
             'testDate' => $test->testDate,
             'totalMarks' => number_format((float) $test->totalMarks, 2, '.', ''),
             'deadlineAt' => $test->deadline_at,
+            'archivedAt' => $test->archived_at,
             'questions' => $this->decodeJson($test->questions, []),
             'subjectId' => $test->subject_id,
             'createdById' => $test->createdById,

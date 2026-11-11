@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useEffect,
   useRef,
   useState,
@@ -30,12 +31,14 @@ import {
   LogOut,
   Menu,
   MessageCircle,
+  Pencil,
   Plus,
   Search,
   Send,
   Settings,
   ShieldCheck,
   Sparkles,
+  Trash2,
   Trophy,
   Users,
   X,
@@ -238,6 +241,7 @@ type Page =
   | "students"
   | "users"
   | "passwords"
+  | "my-password"
   | "queries"
   | "analytics";
 const studentLinks: {
@@ -250,6 +254,7 @@ const studentLinks: {
   { id: "tests", title: "My Tests", icon: FileText },
   { id: "performers", title: "Top Performers", icon: Trophy },
   { id: "contact", title: "Contact Support", icon: MessageCircle },
+  { id: "my-password", title: "My Password", icon: ShieldCheck },
 ];
 const adminLinks: { id: Page; title: string; icon: typeof LayoutDashboard }[] =
   [
@@ -260,7 +265,8 @@ const adminLinks: { id: Page; title: string; icon: typeof LayoutDashboard }[] =
     { id: "access-requests", title: "Access Requests", icon: Clock3 },
     { id: "students", title: "Students", icon: Users },
     { id: "users", title: "Users", icon: ShieldCheck },
-    { id: "passwords", title: "Passwords", icon: ShieldCheck },
+    { id: "my-password", title: "My Password", icon: ShieldCheck },
+    { id: "passwords", title: "Manage Passwords", icon: ShieldCheck },
     { id: "notebook", title: "AI Notebook", icon: BookOpen },
     { id: "queries", title: "Student Queries", icon: MessageCircle },
     { id: "analytics", title: "Analytics", icon: BarChart3 },
@@ -1671,6 +1677,9 @@ function App() {
       (location.hash.slice(1) as Page) || "dashboard",
     ),
     [mobile, setMobile] = useState(false),
+    [showNavOrder, setShowNavOrder] = useState(false),
+    [navOrder, setNavOrder] = useState<Page[]>([]),
+    [draggingPage, setDraggingPage] = useState<Page | null>(null),
     [toast, setToast] = useState("");
   const setAuthenticatedUser = (nextUser: Person | null) => {
     setTestAssetCacheUser(nextUser?.id ?? null);
@@ -1678,7 +1687,7 @@ function App() {
     setUser(nextUser);
   };
   useEffect(() => {
-    const token = localStorage.getItem("nexus.accessToken");
+    const token = getToken();
     if (!token) {
       setBoot(false);
       return;
@@ -1702,6 +1711,19 @@ function App() {
       window.history.replaceState(null, "", "/admin");
     }
   }, [user, adminLoginPath]);
+  useEffect(() => {
+    setNavOrder([]);
+    if (!user || !roleIsAdmin(user)) return;
+    try {
+      const saved = localStorage.getItem(`nexus.admin.navOrder.${user.id}`);
+      const parsed = saved ? JSON.parse(saved) : [];
+      if (Array.isArray(parsed)) setNavOrder(parsed.filter((id): id is Page =>
+        typeof id === "string" && adminLinks.some((link) => link.id === id),
+      ));
+    } catch {
+      setNavOrder([]);
+    }
+  }, [user?.id]);
   useEffect(() => {
     if (adminArea && !boot && !user && !adminLoginPath) {
       window.history.replaceState(null, "", "/admin/login");
@@ -1736,6 +1758,14 @@ function App() {
     clearResourceCache();
     setAuthenticatedUser(null);
     navigate("dashboard");
+  }
+  function passwordChanged() {
+    const wasAdmin = roleIsAdmin(user);
+    setToken(null);
+    clearResourceCache();
+    setAuthenticatedUser(null);
+    setAuthError("Password updated. Sign in again with your new password.");
+    window.history.replaceState(null, "", wasAdmin ? "/admin/login" : "/");
   }
   if (boot)
     return (
@@ -1782,13 +1812,14 @@ function App() {
             settings: ["admin"],
             students: ["user_manager"],
             users: ["user_manager"],
-            passwords: ["password_manager", "user_manager"],
+            passwords: ["password_manager"],
             "access-requests": ["testing_manager", "teacher_assistant"],
             notebook: ["teacher_assistant"],
             queries: ["student_query"],
             analytics: ["testing_manager"],
           };
           if (link.id === "team") return false;
+          if (link.id === "my-password") return true;
           return (
             requiredPermissions[link.id]?.some((permission) =>
               permissions.has(permission),
@@ -1796,7 +1827,40 @@ function App() {
           );
         })
       : studentLinks;
-  const allowed = links.some((l) => l.id === page) ? page : (links[0]?.id ?? "notebook");
+  const savedOrder = navOrder.length
+    ? navOrder
+    : admin
+      ? (() => {
+          try {
+            const raw = localStorage.getItem(`nexus.admin.navOrder.${user.id}`);
+            const parsed = raw ? JSON.parse(raw) : [];
+            return Array.isArray(parsed) ? parsed.filter((id): id is Page =>
+              typeof id === "string" && adminLinks.some((link) => link.id === id),
+            ) : [];
+          } catch {
+            return [];
+          }
+        })()
+      : [];
+  const orderedLinks = admin
+    ? [...links].sort((left, right) => {
+        const defaultOrder: Page[] = ["analytics", ...adminLinks.filter((link) => link.id !== "analytics").map((link) => link.id)];
+        const order = savedOrder.length
+          ? [...savedOrder, ...defaultOrder.filter((id) => !savedOrder.includes(id))]
+          : defaultOrder;
+        return order.indexOf(left.id) - order.indexOf(right.id);
+      })
+    : links;
+  const saveNavOrder = (from: Page, to: Page) => {
+    const next = orderedLinks.map((item) => item.id);
+    const fromIndex = next.indexOf(from);
+    const toIndex = next.indexOf(to);
+    if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return;
+    next.splice(toIndex, 0, ...next.splice(fromIndex, 1));
+    setNavOrder(next);
+    localStorage.setItem(`nexus.admin.navOrder.${user.id}`, JSON.stringify(next));
+  };
+  const allowed = orderedLinks.some((l) => l.id === page) ? page : (orderedLinks[0]?.id ?? "notebook");
   return (
     <div className="layout">
       <aside className={`sidebar ${mobile ? "sidebar-open" : ""}`}>
@@ -1819,12 +1883,33 @@ function App() {
         <div className="nav-caption">
           {admin ? "ADMIN WORKSPACE" : "STUDENT SPACE"}
         </div>
+        {admin && (
+          <button
+            type="button"
+            className="nav-customize-button"
+            aria-expanded={showNavOrder}
+            onClick={() => setShowNavOrder((open) => !open)}
+          >
+            {showNavOrder ? "Done arranging tabs" : "Customize tab order"}
+          </button>
+        )}
         <nav aria-label="Main navigation">
-          {links.map((item) => {
+          {orderedLinks.map((item) => {
             const Icon = item.icon;
             return (
               <button
                 key={item.id}
+                draggable={admin}
+                onDragStart={() => setDraggingPage(item.id)}
+                onDragOver={(event) => {
+                  if (admin && draggingPage) event.preventDefault();
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  if (draggingPage) saveNavOrder(draggingPage, item.id);
+                  setDraggingPage(null);
+                }}
+                onDragEnd={() => setDraggingPage(null)}
                 className={`nav-item ${allowed === item.id ? "nav-active" : ""}`}
                 onClick={() => navigate(item.id)}
               >
@@ -1833,6 +1918,30 @@ function App() {
               </button>
             );
           })}
+          {admin && showNavOrder && (
+            <div className="nav-order-panel" aria-label="Reorder navigation tabs">
+              <p>Drag tabs or use the arrow buttons to reorder.</p>
+              {orderedLinks.map((item, index) => (
+                <div
+                  className="nav-order-row"
+                  key={item.id}
+                  draggable
+                  onDragStart={() => setDraggingPage(item.id)}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    if (draggingPage) saveNavOrder(draggingPage, item.id);
+                    setDraggingPage(null);
+                  }}
+                  onDragEnd={() => setDraggingPage(null)}
+                >
+                  <span>{item.title}</span>
+                  <button type="button" aria-label={`Move ${item.title} up`} disabled={index === 0} onClick={() => saveNavOrder(item.id, orderedLinks[index - 1].id)}>↑</button>
+                  <button type="button" aria-label={`Move ${item.title} down`} disabled={index === orderedLinks.length - 1} onClick={() => saveNavOrder(item.id, orderedLinks[index + 1].id)}>↓</button>
+                </div>
+              ))}
+            </div>
+          )}
         </nav>
         <div className="sidebar-bottom">
           <div className="secure-note">
@@ -1842,7 +1951,7 @@ function App() {
               <span>Access managed by your account</span>
             </div>
           </div>
-          <button className="profile" onClick={() => navigate("passwords")}>
+          <button className="profile" onClick={() => navigate("my-password")}>
             <div className="avatar">
               {(user.fullName || user.email || "N").slice(0, 1).toUpperCase()}
             </div>
@@ -1907,7 +2016,7 @@ function App() {
           {user.mustResetPassword ? (
             <ChangePassword
               required
-              onDone={() => setUser({ ...user, mustResetPassword: false })}
+              onDone={passwordChanged}
             />
           ) : (
             <PageContent
@@ -1915,6 +2024,7 @@ function App() {
               user={user}
               notify={notify}
               canManageSources={canManageSubjects}
+              onPasswordChanged={passwordChanged}
             />
           )}
         </div>
@@ -2048,11 +2158,13 @@ function PageContent({
   user,
   notify,
   canManageSources,
+  onPasswordChanged,
 }: {
   page: Page;
   user: Person;
   notify: (s: string) => void;
   canManageSources: boolean;
+  onPasswordChanged: () => void;
 }) {
   switch (page) {
     case "dashboard":
@@ -2080,7 +2192,9 @@ function PageContent({
     case "users":
       return <UsersAdmin />;
     case "passwords":
-      return <ChangePassword admin={roleIsAdmin(user)} />;
+      return <ManagedPasswords />;
+    case "my-password":
+      return <ChangePassword onDone={onPasswordChanged} />;
     case "queries":
       return <Queries admin />;
     case "analytics":
@@ -2335,7 +2449,9 @@ function TestRow({ row, onClick }: { row: Data; onClick?: () => void }) {
   const t = row.test ?? row;
   const a = row.attempt ?? {};
   const deadline = formatDateTime(row.effectiveDeadlineAt ?? t.deadlineAt);
-  const status = a.submittedAt && a.isResultReleased === false
+  const status = t.archivedAt
+    ? "Archived · history"
+    : a.submittedAt && a.isResultReleased === false
     ? "Submitted · Under marking"
     : String(
     row.status ??
@@ -4346,6 +4462,9 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
   const subjects = asArray<Data>(subjectData);
   const [newSubject, setNewSubject] = useState(""),
     [subjectCode, setSubjectCode] = useState(""),
+    [editingSubjectId, setEditingSubjectId] = useState(""),
+    [editingSubjectName, setEditingSubjectName] = useState(""),
+    [editingSubjectCode, setEditingSubjectCode] = useState(""),
     [actionError, setActionError] = useState(""),
     [busy, setBusy] = useState("");
   async function createSubject(e: FormEvent) {
@@ -4369,6 +4488,39 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
       setActionError(
         ex instanceof Error ? ex.message : "Could not create subject.",
       );
+    } finally {
+      setBusy("");
+    }
+  }
+  async function saveSubject(subjectId: string) {
+    setBusy("edit");
+    setActionError("");
+    try {
+      await api(`/subjects/${subjectId}`, json("PUT", {
+        name: editingSubjectName.trim(),
+        code: editingSubjectCode.trim(),
+      }));
+      setEditingSubjectId("");
+      refreshSubjects();
+    } catch (ex) {
+      setActionError(ex instanceof Error ? ex.message : "Could not update subject.");
+    } finally {
+      setBusy("");
+    }
+  }
+  async function deleteSubject(subject: Data) {
+    const name = getTitle(subject);
+    if (!window.confirm(
+      `Permanently delete "${name}" and all of its tests, attempts, uploaded files, Notebook sources, chats, prompts, access grants, and stored files? This cannot be undone.`,
+    )) return;
+    setBusy("delete");
+    setActionError("");
+    try {
+      await api(`/subjects/${getId(subject)}`, { method: "DELETE" });
+      setEditingSubjectId("");
+      refreshSubjects();
+    } catch (ex) {
+      setActionError(ex instanceof Error ? ex.message : "Could not delete subject.");
     } finally {
       setBusy("");
     }
@@ -4454,7 +4606,29 @@ function Academic({ canManageSources }: { canManageSources: boolean }) {
                       <b>{getTitle(subject)}</b>
                       <small>{subject.code ?? ""}</small>
                     </div>
+                    {canManageSources && editingSubjectId !== getId(subject) && (
+                      <div className="button-row compact-actions">
+                        <button className="button secondary small-button" type="button" onClick={() => {
+                          setEditingSubjectId(getId(subject));
+                          setEditingSubjectName(String(subject.name ?? ""));
+                          setEditingSubjectCode(String(subject.code ?? ""));
+                          setActionError("");
+                        }}>Edit</button>
+                        <button className="button danger small-button" type="button" disabled={busy !== ""} onClick={() => void deleteSubject(subject)}>Delete</button>
+                      </div>
+                    )}
                   </div>
+                  {canManageSources && editingSubjectId === getId(subject) && (
+                    <form className="inline-fields subject-edit-form" onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveSubject(getId(subject));
+                    }}>
+                      <label>Subject name<input required minLength={1} maxLength={128} value={editingSubjectName} onChange={(event) => setEditingSubjectName(event.target.value)} /></label>
+                      <label>Subject code<input required minLength={1} maxLength={32} value={editingSubjectCode} onChange={(event) => setEditingSubjectCode(event.target.value)} /></label>
+                      <button className="button primary small-button" disabled={busy !== ""}>{busy === "edit" ? "Saving…" : "Save"}</button>
+                      <button className="button secondary small-button" type="button" onClick={() => setEditingSubjectId("")}>Cancel</button>
+                    </form>
+                  )}
                   {canManageSources && (
                     <SubjectSources subjectId={getId(subject)} canManage />
                   )}
@@ -4641,20 +4815,31 @@ function SubjectSources({
 function Team() {
   const { data, error, loading, refresh } =
     useResource<unknown[]>("/team-members");
+  const { data: subjectData, error: subjectError } =
+    useResource<unknown[]>("/subjects/list");
   const rows = asArray<Data>(data);
+  const subjects = asArray<Data>(subjectData);
   const visiblePermissions = (value: unknown) =>
     asArray<string>(value).filter((permission) =>
       adminPermissionOptions.some(([option]) => option === permission),
     );
   const [creating, setCreating] = useState(false),
     [editing, setEditing] = useState(""),
+    [memberDrafts, setMemberDrafts] = useState<Record<string, {
+      fullName: string;
+      email: string;
+      phone: string;
+      permissions: string[];
+      subjectIds: string[];
+    }>>({}),
     [email, setEmail] = useState(""),
     [fullName, setFullName] = useState(""),
     [password, setPassword] = useState(""),
     [permissions, setPermissions] = useState<string[]>(["teacher_assistant"]),
-    [drafts, setDrafts] = useState<Record<string, string[]>>({}),
+    [createSubjectIds, setCreateSubjectIds] = useState<string[]>([]),
     [errorMessage, setErrorMessage] = useState(""),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [memberBusy, setMemberBusy] = useState("");
   async function create(e: FormEvent) {
     e.preventDefault();
     if (
@@ -4667,13 +4852,14 @@ function Team() {
     try {
       await api(
         "/team-members",
-        json("POST", { email, password, fullName, permissions }),
+        json("POST", { email, password, fullName, permissions, subjectIds: createSubjectIds }),
       );
       setCreating(false);
       setEmail("");
       setFullName("");
       setPassword("");
       setPermissions(["teacher_assistant"]);
+      setCreateSubjectIds([]);
       refresh();
     } catch (ex) {
       setErrorMessage(
@@ -4683,38 +4869,66 @@ function Team() {
       setBusy(false);
     }
   }
-  function setDraftPermission(
-    userId: string,
-    permission: string,
-    checked: boolean,
-    current: string[],
-  ) {
-    const existing = drafts[userId] ?? current;
-    setDrafts({
-      ...drafts,
-      [userId]: checked
-        ? [...new Set([...existing, permission])]
-        : existing.filter((value) => value !== permission),
-    });
+  function startEditing(member: Data) {
+    const userId = getId(member);
+    setEditing(userId);
+    setMemberDrafts((current) => ({
+      ...current,
+      [userId]: {
+        fullName: String(member.fullName ?? ""),
+        email: String(member.email ?? ""),
+        phone: String(member.phone ?? ""),
+        permissions: visiblePermissions(member.permissions ?? member.adminPermissions),
+        subjectIds: asArray<string>(member.subjectIds),
+      },
+    }));
   }
-  async function savePermissions(userId: string) {
+  function updateMemberDraft(
+    userId: string,
+    change: Partial<NonNullable<typeof memberDrafts[string]>>,
+  ) {
+    setMemberDrafts((current) => ({
+      ...current,
+      [userId]: { ...current[userId], ...change },
+    }));
+  }
+  async function saveMember(userId: string) {
+    const draft = memberDrafts[userId];
+    if (!draft) return;
     if (
-      (drafts[userId] ?? []).includes("admin") &&
+      draft.permissions.includes("admin") &&
       !window.confirm("Grant this account full super-admin access?")
     )
       return;
     setErrorMessage("");
+    setMemberBusy(userId);
     try {
       await api(
-        `/team-members/${userId}/permissions`,
-        json("PUT", { permissions: drafts[userId] ?? [] }),
+        `/team-members/${userId}`,
+        json("PUT", draft),
       );
       setEditing("");
       refresh();
     } catch (ex) {
-      setErrorMessage(
-        ex instanceof Error ? ex.message : "Could not update permissions.",
-      );
+      setErrorMessage(ex instanceof Error ? ex.message : "Could not update team member.");
+    } finally {
+      setMemberBusy("");
+    }
+  }
+  async function deleteMember(member: Data) {
+    const userId = getId(member);
+    const name = String(member.fullName || member.email || "this team member");
+    if (!window.confirm(`Permanently delete ${name}'s team account? This cannot be undone.`)) return;
+    setErrorMessage("");
+    setMemberBusy(userId);
+    try {
+      await api(`/team-members/${userId}`, { method: "DELETE" });
+      if (editing === userId) setEditing("");
+      refresh();
+    } catch (ex) {
+      setErrorMessage(ex instanceof Error ? ex.message : "Could not delete team member.");
+    } finally {
+      setMemberBusy("");
     }
   }
   return (
@@ -4792,6 +5006,14 @@ function Team() {
                 </label>
               ))}
             </fieldset>
+            <fieldset className="permission-options compact-permissions subject-scope-options">
+              <legend>Subject access scope</legend>
+              <p className="api-note subject-scope-help">Choose one or more subjects to limit this member. Leave all unchecked for unrestricted access.</p>
+              {subjectError ? <ErrorBox error={subjectError} /> : subjects.length ? subjects.map((subject) => {
+                const subjectId = getId(subject);
+                return <label key={subjectId}><input type="checkbox" checked={createSubjectIds.includes(subjectId)} onChange={(event) => setCreateSubjectIds((current) => event.target.checked ? [...current, subjectId] : current.filter((value) => value !== subjectId))} /><span>{getTitle(subject)}</span></label>;
+              }) : <p className="subtle-padding">No subjects are available.</p>}
+            </fieldset>
             <button
               className="button primary"
               disabled={busy || permissions.length === 0}
@@ -4814,81 +5036,126 @@ function Team() {
                   <th>Team member</th>
                   <th>Email</th>
                   <th>Permissions</th>
-                  <th>Account</th>
+                  <th>Subject access</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((r, i) => (
-                  <tr key={getId(r) || i}>
+                  <Fragment key={getId(r) || i}>
+                  <tr>
                     <td>
                       <b>{r.fullName ?? "—"}</b>
                     </td>
                     <td>{r.email ?? "—"}</td>
                     <td>
                       <div className="tag-list">
-                        {visiblePermissions(
-                          r.permissions ?? r.adminPermissions,
-                        ).map((p) => (
-                          <span className="permission-tag" key={p}>
-                            {p.replaceAll("_", " ")}
-                          </span>
+                        {visiblePermissions(r.permissions ?? r.adminPermissions).map((p) => (
+                          <span className="permission-tag" key={p}>{p.replaceAll("_", " ")}</span>
                         ))}
                       </div>
-                      {editing === getId(r) && (
-                        <fieldset className="permission-options compact-permissions">
-                          <legend>Edit permissions</legend>
-                          {adminPermissionOptions.map(([value, title]) => {
-                            const current = visiblePermissions(
-                              r.permissions ?? r.adminPermissions,
-                            );
-                            return (
+                    </td>
+                    <td>
+                      {asArray<string>(r.subjectIds).length
+                        ? asArray<string>(r.subjectIds).map((subjectId) => (
+                            <span className="permission-tag" key={subjectId}>
+                              {getTitle(subjects.find((subject) => getId(subject) === subjectId) ?? { id: subjectId })}
+                            </span>
+                          ))
+                        : <span className="api-note">Unrestricted</span>}
+                    </td>
+                    <td>
+                      <div className="button-row compact-actions">
+                        <button
+                          className="button secondary small-button"
+                          type="button"
+                          onClick={() => editing === getId(r) ? setEditing("") : startEditing(r)}
+                        >
+                          <Pencil size={14} /> {editing === getId(r) ? "Close" : "Edit"}
+                        </button>
+                        <button
+                          className="button secondary small-button danger-button"
+                          type="button"
+                          disabled={memberBusy === getId(r)}
+                          onClick={() => void deleteMember(r)}
+                        >
+                          <Trash2 size={14} /> Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {editing === getId(r) && memberDrafts[getId(r)] && (
+                    <tr>
+                      <td colSpan={5}>
+                        <form
+                          className="team-edit-panel"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            void saveMember(getId(r));
+                          }}
+                        >
+                          <div className="inline-fields">
+                            <label>Full name<input maxLength={200} value={memberDrafts[getId(r)].fullName} onChange={(event) => updateMemberDraft(getId(r), { fullName: event.target.value })} /></label>
+                            <label>Email<input type="email" required maxLength={254} value={memberDrafts[getId(r)].email} onChange={(event) => updateMemberDraft(getId(r), { email: event.target.value })} /></label>
+                            <label>Phone<input maxLength={32} value={memberDrafts[getId(r)].phone} onChange={(event) => updateMemberDraft(getId(r), { phone: event.target.value })} /></label>
+                          </div>
+                          <fieldset className="permission-options">
+                            <legend>Permissions</legend>
+                            {adminPermissionOptions.map(([value, title]) => (
                               <label key={value}>
                                 <input
                                   type="checkbox"
-                                  checked={(
-                                    drafts[getId(r)] ?? current
-                                  ).includes(value)}
-                                  onChange={(e) =>
-                                    setDraftPermission(
-                                      getId(r),
-                                      value,
-                                      e.target.checked,
-                                      current,
-                                    )
-                                  }
+                                  checked={memberDrafts[getId(r)].permissions.includes(value)}
+                                  onChange={(event) => {
+                                    const current = memberDrafts[getId(r)].permissions;
+                                    updateMemberDraft(getId(r), {
+                                      permissions: event.target.checked
+                                        ? [...new Set([...current, value])]
+                                        : current.filter((permission) => permission !== value),
+                                    });
+                                  }}
                                 />
                                 {title}
                               </label>
-                            );
-                          })}
-                          <button
-                            className="button primary small-button"
-                            onClick={() => void savePermissions(getId(r))}
-                          >
-                            Save
-                          </button>
-                        </fieldset>
-                      )}
-                    </td>
-                    <td>
-                      <span className="status success">Active</span>
-                      <button
-                        className="button secondary small-button"
-                        onClick={() => {
-                          const userId = getId(r);
-                          setEditing(editing === userId ? "" : userId);
-                          setDrafts({
-                            ...drafts,
-                            [userId]: visiblePermissions(
-                              r.permissions ?? r.adminPermissions,
-                            ),
-                          });
-                        }}
-                      >
-                        Permissions
-                      </button>
-                    </td>
-                  </tr>
+                            ))}
+                          </fieldset>
+                          <fieldset className="permission-options compact-permissions subject-scope-options">
+                            <legend>Subject access scope</legend>
+                            <p className="api-note subject-scope-help">Select one or more subjects to restrict access. No selections means unrestricted access.</p>
+                            {subjectError ? <ErrorBox error={subjectError} /> : subjects.length ? subjects.map((subject) => {
+                              const subjectId = getId(subject);
+                              return (
+                                <label key={subjectId}>
+                                  <input
+                                    type="checkbox"
+                                    checked={memberDrafts[getId(r)].subjectIds.includes(subjectId)}
+                                    onChange={(event) => {
+                                      const current = memberDrafts[getId(r)].subjectIds;
+                                      updateMemberDraft(getId(r), {
+                                        subjectIds: event.target.checked
+                                          ? [...new Set([...current, subjectId])]
+                                          : current.filter((id) => id !== subjectId),
+                                      });
+                                    }}
+                                  />
+                                  <span>{getTitle(subject)}</span>
+                                </label>
+                              );
+                            }) : <p className="subtle-padding">No subjects are available.</p>}
+                          </fieldset>
+                          <div className="button-row">
+                            <button className="button primary" disabled={memberBusy === getId(r) || memberDrafts[getId(r)].permissions.length === 0}>
+                              {memberBusy === getId(r) ? "Saving…" : "Save changes"}
+                            </button>
+                            <button className="button secondary" type="button" disabled={memberBusy === getId(r)} onClick={() => setEditing("")}>
+                              Cancel
+                            </button>
+                          </div>
+                        </form>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -5081,7 +5348,7 @@ function UsersAdmin() {
   notify: (s: string) => void;
   settingsOnly?: boolean;
 }) {
-  const { data, error, loading } = useResource<unknown[]>(
+  const { data, error, loading, refresh: refreshTests } = useResource<unknown[]>(
     settingsOnly ? undefined : "/tests",
   );
   const { data: subjectData } = useResource<unknown[]>(
@@ -5090,6 +5357,11 @@ function UsersAdmin() {
   const canManageGradingSettings = Boolean(
     roleIsAdmin(user) &&
       user.adminPermissions?.includes("admin"),
+  );
+  const canManageTests = Boolean(
+    user.adminPermissions?.some((permission) =>
+      ["admin", "teacher_assistant"].includes(permission),
+    ),
   );
   const {
     data: gradingSettingsData,
@@ -5108,11 +5380,52 @@ function UsersAdmin() {
   const [savingReportPrompt, setSavingReportPrompt] = useState(false);
   const [reportPromptMessage, setReportPromptMessage] = useState("");
   const [sourceFileBusy, setSourceFileBusy] = useState("");
+  const [editingTitleTest, setEditingTitleTest] = useState<Data | null>(null);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [lifecycleTest, setLifecycleTest] = useState<Data | null>(null);
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const [selected, setSelected] = useState(""),
     [showCreate, setShowCreate] = useState(false),
     [showPreview, setShowPreview] = useState(false),
     [subjectId, setSubjectId] = useState("");
   const activeTab = settingsOnly ? "settings" : "tests";
+  async function saveTestTitle(event: FormEvent) {
+    event.preventDefault();
+    if (!editingTitleTest) return;
+    setLifecycleBusy(true);
+    try {
+      await api(`/tests/${getId(editingTitleTest)}`, json("PUT", { title: titleDraft }));
+      setEditingTitleTest(null);
+      await refreshTests();
+      notify("Test title updated.");
+    } catch (ex) {
+      notify(ex instanceof Error ? ex.message : "Could not update the test title.");
+    } finally {
+      setLifecycleBusy(false);
+    }
+  }
+  async function deleteTest(mode: "archive" | "permanent") {
+    if (!lifecycleTest) return;
+    setLifecycleBusy(true);
+    try {
+      await api(
+        `/tests/${getId(lifecycleTest)}`,
+        json("DELETE", { mode }),
+      );
+      if (selected === getId(lifecycleTest)) setSelected("");
+      setLifecycleTest(null);
+      await refreshTests();
+      notify(
+        mode === "archive"
+          ? "Test removed from current and future access. Student history was preserved."
+          : "Test, student reports, and related files were permanently deleted.",
+      );
+    } catch (ex) {
+      notify(ex instanceof Error ? ex.message : "Could not delete the test.");
+    } finally {
+      setLifecycleBusy(false);
+    }
+  }
   useEffect(() => {
     if (gradingSettingsData) {
       setDeficiencyReportPrompt(
@@ -5197,7 +5510,7 @@ function UsersAdmin() {
         description={settingsOnly
           ? "Manage shared application behavior and grading settings."
           : "Browse tests by subject, review attempts, and update marks."}
-        action={!settingsOnly && activeTab === "tests" ? (
+        action={!settingsOnly && activeTab === "tests" && canManageTests ? (
           <div className="button-row">
             <button
               className="button secondary"
@@ -5419,7 +5732,34 @@ function UsersAdmin() {
                   >
                     <Download size={14} /> Export PDF
                   </button>
-                  <span className="row-date">{t.status ?? "Published"}</span>
+                  {canManageTests && (
+                    <>
+                      <button
+                        type="button"
+                        className="button secondary small-button"
+                        aria-label={`Edit title for ${getTitle(t)}`}
+                        onClick={() => {
+                          setEditingTitleTest(t);
+                          setTitleDraft(getTitle(t));
+                        }}
+                      >
+                        Edit title
+                      </button>
+                      <button
+                        type="button"
+                        className="button danger small-button"
+                        aria-label={`Delete ${getTitle(t)}`}
+                        onClick={() => setLifecycleTest(t)}
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                  {t.archivedAt ? (
+                    <span className="status archived-status">Archived</span>
+                  ) : (
+                    <span className="row-date">{t.status ?? "Published"}</span>
+                  )}
                 </div>
                 {asArray<Data>(t.sourceFiles).length > 0 && (
                   <div className="source-file-list">
@@ -5465,6 +5805,125 @@ function UsersAdmin() {
         <CreateTest onClose={() => setShowCreate(false)} notify={notify} />
       )}
       {showPreview && <QuestionPreview onClose={() => setShowPreview(false)} />}
+      {editingTitleTest && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => !lifecycleBusy && setEditingTitleTest(null)}
+        >
+          <section
+            className="modal lifecycle-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-test-title-heading"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="card-heading">
+              <div>
+                <div className="eyebrow">TEST DETAILS</div>
+                <h2 id="edit-test-title-heading">Edit test title</h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                disabled={lifecycleBusy}
+                onClick={() => setEditingTitleTest(null)}
+              >
+                <X />
+              </button>
+            </div>
+            <form className="form-stack" onSubmit={(event) => void saveTestTitle(event)}>
+              <label htmlFor="test-title-edit">Test title</label>
+              <input
+                id="test-title-edit"
+                autoFocus
+                required
+                maxLength={200}
+                value={titleDraft}
+                onChange={(event) => setTitleDraft(event.target.value)}
+                disabled={lifecycleBusy}
+              />
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={lifecycleBusy}
+                  onClick={() => setEditingTitleTest(null)}
+                >
+                  Cancel
+                </button>
+                <button className="button primary" disabled={lifecycleBusy}>
+                  {lifecycleBusy ? "Saving…" : "Save title"}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
+      {lifecycleTest && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => !lifecycleBusy && setLifecycleTest(null)}
+        >
+          <section
+            className="modal lifecycle-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-test-heading"
+            aria-describedby="delete-test-description"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="card-heading">
+              <div>
+                <div className="eyebrow">TEST LIFECYCLE</div>
+                <h2 id="delete-test-heading">Delete “{getTitle(lifecycleTest)}”?</h2>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                disabled={lifecycleBusy}
+                onClick={() => setLifecycleTest(null)}
+              >
+                <X />
+              </button>
+            </div>
+            <p id="delete-test-description">
+              Choose whether to remove this test from student access while keeping
+              reports, or permanently erase the test, all student attempt/report
+              data, and related files.
+            </p>
+            <div className="button-row lifecycle-actions">
+              <button
+                type="button"
+                className="button secondary"
+                disabled={lifecycleBusy}
+                onClick={() => setLifecycleTest(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="button secondary"
+                disabled={lifecycleBusy}
+                onClick={() => void deleteTest("archive")}
+              >
+                {lifecycleBusy ? "Working…" : "Delete onwards"}
+              </button>
+              <button
+                type="button"
+                className="button danger"
+                disabled={lifecycleBusy}
+                onClick={() => void deleteTest("permanent")}
+              >
+                Permanently delete
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       </>
       )}
     </>
@@ -7435,25 +7894,15 @@ function Analytics() {
 }
 function ChangePassword({
   required = false,
-  admin = false,
   onDone,
 }: {
   required?: boolean;
-  admin?: boolean;
   onDone?: () => void;
 }) {
-  const [current, setCurrent] = useState(""),
-    [next, setNext] = useState(""),
+  const [next, setNext] = useState(""),
     [confirm, setConfirm] = useState(""),
     [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false);
-  const [targetQuery, setTargetQuery] = useState(""),
-    [targets, setTargets] = useState<Data[]>([]),
-    [target, setTarget] = useState<Data | null>(null),
-    [newTargetPassword, setNewTargetPassword] = useState(""),
-    [targetCurrentPassword, setTargetCurrentPassword] = useState(""),
-    [targetMessage, setTargetMessage] = useState(""),
-    [targetBusy, setTargetBusy] = useState(false);
   async function submit(e: FormEvent) {
     e.preventDefault();
     setMessage("");
@@ -7465,10 +7914,9 @@ function ChangePassword({
     try {
       await api(
         "/auth/change-password",
-        json("POST", { currentPassword: current, newPassword: next }),
+        json("POST", { newPassword: next }),
       );
-      setMessage("Password changed successfully.");
-      setCurrent("");
+      setMessage("Password changed. Please sign in again with your new password.");
       setNext("");
       setConfirm("");
       onDone?.();
@@ -7480,6 +7928,75 @@ function ChangePassword({
       setBusy(false);
     }
   }
+  return (
+    <>
+      <Heading
+        eyebrow="ACCOUNT SECURITY"
+        title="My Password"
+        description="Set a new password for your account."
+      />
+      {required && (
+        <div className="alert warning">
+          <ShieldCheck size={18} /> Your account requires a password reset
+          before continuing.
+        </div>
+      )}
+      <Card className="password-card">
+        <div className="card-heading">
+          <div>
+            <h2>Change your password</h2>
+            <p>Minimum 12 characters. You will need to sign in again afterward.</p>
+          </div>
+          <ShieldCheck size={20} />
+        </div>
+        <form className="form-stack" onSubmit={submit}>
+          <label>
+            New password
+            <input
+              type="password"
+              autoComplete="new-password"
+              minLength={12}
+              maxLength={200}
+              required
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+            />
+          </label>
+          <label>
+            Confirm new password
+            <input
+              type="password"
+              autoComplete="new-password"
+              minLength={12}
+              maxLength={200}
+              required
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+            />
+          </label>
+          {message && (
+            <div className={`alert ${message.startsWith("Password changed") ? "success" : "error"}`} role="status">
+              {message}
+            </div>
+          )}
+          <button className="button primary" disabled={busy}>
+            {busy ? "Updating…" : "Change password"}
+            <Check size={16} />
+          </button>
+        </form>
+      </Card>
+    </>
+  );
+}
+
+function ManagedPasswords() {
+  const [targetQuery, setTargetQuery] = useState(""),
+    [targets, setTargets] = useState<Data[]>([]),
+    [target, setTarget] = useState<Data | null>(null),
+    [newTargetPassword, setNewTargetPassword] = useState(""),
+    [targetCurrentPassword, setTargetCurrentPassword] = useState(""),
+    [targetMessage, setTargetMessage] = useState(""),
+    [targetBusy, setTargetBusy] = useState(false);
   async function searchTarget(e: FormEvent) {
     e.preventDefault();
     setTargetMessage("");
@@ -7534,78 +8051,17 @@ function ChangePassword({
     <>
       <Heading
         eyebrow="ACCOUNT SECURITY"
-        title="Passwords"
-        description="Update your own password using the authenticated account endpoint."
+        title="Manage Passwords"
+        description="Reset another account’s password. You cannot reset your own account here."
       />
-      {required && (
-        <div className="alert warning">
-          <ShieldCheck size={18} /> Your account requires a password reset
-          before continuing.
-        </div>
-      )}
       <Card className="password-card">
-        <div className="card-heading">
-          <div>
-            <h2>Change your password</h2>
-            <p>Minimum 12 characters for the new password.</p>
-          </div>
-          <ShieldCheck size={20} />
-        </div>
-        <form className="form-stack" onSubmit={submit}>
-          <label>
-            Current password
-            <input
-              type="password"
-              autoComplete="current-password"
-              required
-              value={current}
-              onChange={(e) => setCurrent(e.target.value)}
-            />
-          </label>
-          <label>
-            New password
-            <input
-              type="password"
-              autoComplete="new-password"
-              minLength={12}
-              required
-              value={next}
-              onChange={(e) => setNext(e.target.value)}
-            />
-          </label>
-          <label>
-            Confirm new password
-            <input
-              type="password"
-              autoComplete="new-password"
-              minLength={12}
-              required
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-            />
-          </label>
-          {message && (
-            <div
-              className={`alert ${message.includes("successfully") ? "success" : "error"}`}
-            >
-              {message}
-            </div>
-          )}
-          <button className="button primary" disabled={busy}>
-            {busy ? "Updating…" : "Change password"}
-            <Check size={16} />
-          </button>
-        </form>
-      </Card>
-      {admin && (
-        <Card className="password-card">
           <div className="card-heading">
             <div>
               <h2>Reset another account</h2>
               <p>
                 Search by email. Student password resets require no current
-                password; resetting a non-super-admin team member requires your
-                current password.
+                password; a super-admin resetting another non-super-admin team
+                member must verify their current password.
               </p>
             </div>
           </div>
@@ -7670,12 +8126,12 @@ function ChangePassword({
           {targetMessage && (
             <div
               className={`alert ${targetMessage.startsWith("Password reset") ? "success" : "error"}`}
+              role="status"
             >
               {targetMessage}
             </div>
           )}
-        </Card>
-      )}
+      </Card>
     </>
   );
 }

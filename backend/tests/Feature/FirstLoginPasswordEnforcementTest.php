@@ -98,7 +98,7 @@ class FirstLoginPasswordEnforcementTest extends TestCase
             ->assertJsonPath('code', 'PASSWORD_RESET_REQUIRED');
     }
 
-    public function test_the_initial_password_cannot_be_kept_or_replaced_with_a_weak_one(): void
+    public function test_the_initial_password_cannot_be_replaced_with_a_weak_one_and_current_password_is_not_required(): void
     {
         $token = $this->loginWithInitialPassword($this->createStudentThroughAdminApi());
 
@@ -109,13 +109,12 @@ class FirstLoginPasswordEnforcementTest extends TestCase
             ])->assertBadRequest();
         }
         $this->withToken($token)->postJson('/api/auth/change-password', [
-            'currentPassword' => 'not-the-password',
             'newPassword' => 'a-long-new-password',
-        ])->assertUnauthorized();
-        $this->assertDatabaseHas('users', ['email' => 'new.student@example.test', 'must_reset_password' => 1]);
+        ])->assertCreated()->assertJson(['success' => true]);
+        $this->assertDatabaseHas('users', ['email' => 'new.student@example.test', 'must_reset_password' => 0]);
     }
 
-    public function test_the_new_password_must_differ_from_the_current_one(): void
+    public function test_self_service_password_change_uses_only_the_new_password(): void
     {
         $studentId = $this->createUser();
         DB::table('users')->where('id', $studentId)->update([
@@ -124,9 +123,8 @@ class FirstLoginPasswordEnforcementTest extends TestCase
         ]);
 
         $this->withToken($this->token($studentId))->postJson('/api/auth/change-password', [
-            'currentPassword' => 'a-long-current-password',
             'newPassword' => 'a-long-current-password',
-        ])->assertBadRequest();
+        ])->assertCreated()->assertJson(['success' => true]);
     }
 
     public function test_changing_the_password_unlocks_the_account_and_retires_the_initial_one(): void
@@ -137,9 +135,13 @@ class FirstLoginPasswordEnforcementTest extends TestCase
         $this->withToken($oldToken)->postJson('/api/auth/change-password', [
             'currentPassword' => self::INITIAL_PASSWORD,
             'newPassword' => 'my-own-strong-password',
-        ])->assertCreated()->assertJson(['success' => true]);
+        ])->assertCreated()->assertJson(['success' => true])->assertJsonMissingPath('password');
 
         $this->withToken($oldToken)->getJson('/api/auth/me')->assertUnauthorized();
+        $this->assertDatabaseHas('audit_logs', [
+            'event' => 'password_changed',
+            'userId' => DB::table('users')->where('email', $email)->value('id'),
+        ]);
         $this->postJson('/api/auth/login', ['email' => $email, 'password' => self::INITIAL_PASSWORD])
             ->assertUnauthorized();
 
@@ -157,14 +159,12 @@ class FirstLoginPasswordEnforcementTest extends TestCase
 
         for ($attempt = 0; $attempt < 10; $attempt++) {
             $this->withToken($token)->postJson('/api/auth/change-password', [
-                'currentPassword' => 'guess-number-'.$attempt,
-                'newPassword' => 'a-long-new-password',
-            ])->assertUnauthorized();
+                'newPassword' => 'short',
+            ])->assertBadRequest();
         }
 
         $this->withToken($token)->postJson('/api/auth/change-password', [
-            'currentPassword' => 'one-guess-too-many',
-            'newPassword' => 'a-long-new-password',
+            'newPassword' => 'short',
         ])->assertStatus(429);
     }
 }

@@ -48,13 +48,17 @@ class SubjectsController
             'name' => ['sometimes', 'required', 'string', 'min:1', 'max:128'],
         ]);
 
-        return response()->json($this->subjects->update($id, $input));
+        return response()->json($this->subjects->update(
+            $id,
+            $input,
+            (string) $request->attributes->get('apiIdentity')['userId']
+        ));
     }
 
-    public function destroy(string $id): JsonResponse
+    public function destroy(Request $request, string $id): JsonResponse
     {
         $this->validateUuid($id);
-        $this->subjects->delete($id);
+        $this->subjects->delete($id, (string) $request->attributes->get('apiIdentity')['userId']);
 
         return response()->json(['success' => true]);
     }
