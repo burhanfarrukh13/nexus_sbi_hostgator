@@ -27,11 +27,26 @@ class QuestionImportParser
             $sources[] = ['sourceIndex' => $sourceIndex, 'pageNumber' => null];
         }
 
+        $knownIdentifiers = [];
+        foreach ($lines as $line) {
+            if (preg_match(self::QUESTION, $line, $question) === 1 &&
+                preg_match('/^(\d+)([a-z]*)$/i', $question[1], $parts) === 1 &&
+                (int) $parts[1] > 0) {
+                $knownIdentifiers[] = (int) $parts[1].strtolower($parts[2]);
+            }
+        }
+        $knownIdentifiers = array_values(array_unique($knownIdentifiers));
+        usort($knownIdentifiers, static fn (string $left, string $right): int =>
+            strlen($right) <=> strlen($left) ?: strcmp($right, $left)
+        );
+
         $sections = [];
         $errors = [];
         foreach ($lines as $index => $line) {
             $question = preg_match(self::QUESTION, $line, $q) ? $q : null;
-            $numbered = preg_match(self::NUMBERED, $line, $n) ? $n : null;
+            $numbered = $question === null
+                ? $this->numberedHeading($line, $knownIdentifiers)
+                : null;
             if ($question === null && $numbered === null) {
                 if (preg_match(self::CANDIDATE, $line)) {
                     $errors[] = 'Malformed section heading on line '.($index + 1).'.';
@@ -195,11 +210,45 @@ class QuestionImportParser
     {
         $body = [];
         for ($index = $section['start']; $index < $section['end']; $index++) {
-            if (($sources[$index]['sourceIndex'] ?? null) === $section['sourceIndex']) {
+            if (($sources[$index]['sourceIndex'] ?? null) === $section['sourceIndex'] &&
+                !$this->isDocumentMetadataLine($lines[$index])) {
                 $body[] = $lines[$index];
             }
         }
         return $body;
+    }
+
+    private function numberedHeading(string $line, array $knownIdentifiers): ?array
+    {
+        if (preg_match('/^\s*(answer|ans|solution|marking(?:\s+scheme)?|scheme)\b(.*)$/i', $line, $heading) !== 1) {
+            return null;
+        }
+
+        $tail = preg_replace('/^(?:(?:for|to)\s+)?(?:question\s*)?/i', '', ltrim($heading[2])) ?? '';
+        $tail = ltrim($tail, " \t#");
+        foreach ($knownIdentifiers as $identifier) {
+            if (strncasecmp($tail, $identifier, strlen($identifier)) !== 0) {
+                continue;
+            }
+
+            $content = substr($tail, strlen($identifier));
+            $content = preg_replace('/^\s*[:.)-]\s*/', '', $content) ?? $content;
+
+            return [
+                1 => $heading[1],
+                2 => $identifier,
+                3 => ltrim($content),
+            ];
+        }
+
+        return preg_match(self::NUMBERED, $line, $numbered) === 1
+            ? $numbered
+            : null;
+    }
+
+    private function isDocumentMetadataLine(string $line): bool
+    {
+        return preg_match('/^\s*(?:section\s+[a-z0-9]+\b|total\s+\d+(?:\.\d+)?\s+marks?\s*$)/i', $line) === 1;
     }
 
     private function combinedContent(array $sections, array $lines, array $sources): string

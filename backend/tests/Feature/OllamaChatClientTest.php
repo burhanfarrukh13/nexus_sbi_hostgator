@@ -18,7 +18,7 @@ class OllamaChatClientTest extends TestCase
         Config::set('services.ai_chat.model', 'test-chat-model');
     }
 
-    public function test_it_sends_openai_compatible_chat_requests_to_ollama_cloud(): void
+    public function test_it_sends_openai_compatible_chat_requests_to_configured_provider(): void
     {
         Http::fake([
             'ollama.example.test/*' => Http::response([
@@ -127,7 +127,7 @@ class OllamaChatClientTest extends TestCase
 
     public function test_it_sends_image_content_to_a_vision_capable_model(): void
     {
-        Config::set('services.ai_chat.model', 'gemma4:31b');
+        Config::set('services.ai_chat.model', 'qwen/qwen3-vl-30b-a3b-instruct');
         Http::fake([
             'ollama.example.test/*' => Http::response([
                 'choices' => [

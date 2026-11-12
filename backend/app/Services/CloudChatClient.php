@@ -21,10 +21,10 @@ class CloudChatClient
         $timeout = min(300, max(3, $timeoutOverride ?? (int) config('services.ai_chat.timeout', 300)));
         $connectTimeout = min(30, max(2, (int) config('services.ai_chat.connect_timeout', 15)));
         if (!str_starts_with($url, 'https://') || $key === '' || $model === '') {
-            throw new RuntimeException('Ollama Cloud is not configured. Set OLLAMA_API_URL, OLLAMA_API_KEY, and OLLAMA_MODEL.');
+            throw new RuntimeException('AI chat provider is not configured. Set OLLAMA_API_URL, OLLAMA_API_KEY, and OLLAMA_MODEL.');
         }
         if ($this->containsImages($messages) && !$this->supportsVision($model)) {
-            throw new RuntimeException('The configured Ollama model does not support image grading. Set OLLAMA_MODEL to a vision-capable model such as gemma4.');
+            throw new RuntimeException('The configured model is not recognized as vision-capable. Use a vision-capable model for image grading.');
         }
 
         $payload = [
@@ -54,7 +54,7 @@ class CloudChatClient
                     $this->waitBeforeRetry($attempt, $retryDelays);
                     continue;
                 }
-                throw new RuntimeException('Ollama chat provider is unavailable.');
+                throw new RuntimeException('AI chat provider is unavailable.');
             }
             if ($response->successful() ||
                 ($response->status() < 500 && $response->status() !== 429) ||
@@ -65,10 +65,10 @@ class CloudChatClient
         }
 
         if ($response === null) {
-            throw new RuntimeException('Ollama chat provider is unavailable.');
+            throw new RuntimeException('AI chat provider is unavailable.');
         }
         if (!$response->successful()) {
-            throw new RuntimeException('Ollama chat provider rejected the request.');
+            throw new RuntimeException('AI chat provider rejected the request.');
         }
 
         $content = $response->json('choices.0.message.content');
@@ -81,7 +81,7 @@ class CloudChatClient
             )));
         }
         if (!is_string($content) || trim($content) === '') {
-            throw new RuntimeException('Ollama chat provider returned no answer.');
+            throw new RuntimeException('AI chat provider returned no answer.');
         }
 
         return trim($content);
@@ -135,6 +135,6 @@ class CloudChatClient
 
     private function supportsVision(string $model): bool
     {
-        return preg_match('/(?:^|[:\/-])(?:vision|llava|gemma[34]|qwen2\.5-vl|qwen2\.5.*vl|pixtral|minicpm-v|granite3-vision|moondream|mistral-small3\.1|llama-?3\.2-vision|phi-3\.5-vision|smolvlm)/i', trim($model)) === 1;
+        return preg_match('/(?:^|[:\/-])(?:vision|llava|gemma[34]|qwen2\.5-vl|qwen2\.5.*vl|qwen3(?:\.\d+)?-vl|pixtral|minicpm-v|granite3-vision|moondream|mistral-small3\.1|llama-?3\.2-vision|phi-3\.5-vision|smolvlm)/i', trim($model)) === 1;
     }
 }

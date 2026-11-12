@@ -2142,10 +2142,6 @@ function Login({
             <ArrowRight size={17} />
           </button>
         </form>
-        <div className="auth-foot">
-          <ShieldCheck size={15} /> Role and permissions are verified by the
-          Nexus API. Sign-in requests are rate-limited to protect accounts.
-        </div>
       </section>
       <div className="auth-tagline">
         <Sparkles size={18} /> A focused space for learning and progress
@@ -6339,9 +6335,7 @@ function QuestionPreview({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <p className="api-note">
-          Uploads one or more PDFs or DOCX files to the confirmed{" "}
-          <code>POST /api/tests/questions/preview</code> endpoint. Preview only;
-          this does not create or save a test.
+          Preview only; this does not create or save a test.
         </p>
         <form className="form-stack" onSubmit={preview}>
           <label>

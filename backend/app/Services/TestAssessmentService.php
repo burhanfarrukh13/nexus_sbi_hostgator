@@ -174,7 +174,7 @@ class TestAssessmentService
                     trim($candidate['deficiencyReport']) === '' ||
                     !is_array($candidate['questions'] ?? null) ||
                     count($candidate['questions']) !== count($rubric)) {
-                    throw new RuntimeException('Ollama returned an incomplete assessment response.');
+                    throw new RuntimeException('AI model returned an incomplete assessment response.');
                 }
                 $decoded = $candidate;
                 break;
@@ -184,7 +184,7 @@ class TestAssessmentService
         }
         if (!is_array($decoded)) {
             throw new RuntimeException(
-                'Ollama could not return a valid assessment after two attempts.',
+                'AI model could not return a valid assessment after two attempts.',
                 previous: $lastError
             );
         }
@@ -192,7 +192,7 @@ class TestAssessmentService
             trim($decoded['deficiencyReport']) === '' ||
             !is_array($decoded['questions'] ?? null) ||
             count($decoded['questions']) !== count($rubric)) {
-            throw new RuntimeException('Ollama returned an incomplete assessment response.');
+            throw new RuntimeException('AI model returned an incomplete assessment response.');
         }
 
         $rubricByNumber = [];
@@ -207,12 +207,12 @@ class TestAssessmentService
             if (!is_int($number) || !isset($rubricByNumber[$number]) || isset($seenQuestions[$number]) ||
                 !is_string($gradedQuestion['deficiencyReport'] ?? null) ||
                 !is_array($gradedQuestion['criteria'] ?? null)) {
-                throw new RuntimeException('Ollama returned an invalid question assessment.');
+                throw new RuntimeException('AI model returned an invalid question assessment.');
             }
             $seenQuestions[$number] = true;
             $expected = $rubricByNumber[$number];
             if (count($gradedQuestion['criteria']) !== count($expected['criteria'])) {
-                throw new RuntimeException('Ollama returned an incomplete criterion assessment.');
+                throw new RuntimeException('AI model returned an incomplete criterion assessment.');
             }
             $gradedCriteria = [];
             $seenCriteria = [];
@@ -223,19 +223,19 @@ class TestAssessmentService
                 $awarded = $gradedCriterion['marksAwarded'] ?? null;
                 if (!is_int($index) || !isset($expected['criteria'][$index]) || isset($seenCriteria[$index]) ||
                     !is_numeric($awarded) || !is_string($gradedCriterion['feedback'] ?? null)) {
-                    throw new RuntimeException('Ollama returned an invalid criterion assessment.');
+                    throw new RuntimeException('AI model returned an invalid criterion assessment.');
                 }
                 $maximum = $expected['criteria'][$index]['marksAvailable'];
                 $awarded = round((float) $awarded, 2);
                 if ($awarded < 0 || $awarded > $maximum) {
-                    throw new RuntimeException('Ollama returned marks outside the permitted rubric.');
+                    throw new RuntimeException('AI model returned marks outside the permitted rubric.');
                 }
                 $evidence = $gradedCriterion['evidence'] ?? [];
                 if (is_string($evidence)) {
                     $evidence = [$evidence];
                 }
                 if (!is_array($evidence)) {
-                    throw new RuntimeException('Ollama returned invalid answer evidence.');
+                    throw new RuntimeException('AI model returned invalid answer evidence.');
                 }
                 $evidence = array_values(array_filter(
                     array_map(static fn (mixed $item): string => is_string($item) ? trim($item) : '', $evidence),
@@ -297,7 +297,7 @@ class TestAssessmentService
         }
 
         if (count($seenQuestions) !== count($rubric)) {
-            throw new RuntimeException('Ollama did not assess every question.');
+            throw new RuntimeException('AI model did not assess every question.');
         }
         usort($gradedQuestions, static fn (array $a, array $b): int => $a['questionNumber'] <=> $b['questionNumber']);
         $report = mb_substr(trim($decoded['deficiencyReport']), 0, 10000);
@@ -347,7 +347,7 @@ class TestAssessmentService
                 try {
                     $result = $this->decodeModelJson($this->chat->complete($messages, true), 'transcription');
                     if (!is_array($result['transcriptions'] ?? null)) {
-                        throw new RuntimeException('Ollama returned an incomplete page transcription.');
+                        throw new RuntimeException('AI model returned an incomplete page transcription.');
                     }
                     break;
                 } catch (\Throwable $error) {
@@ -356,7 +356,7 @@ class TestAssessmentService
                 }
             }
             if (!is_array($result)) {
-                throw new RuntimeException('Ollama could not transcribe an answer page after two attempts.', previous: $lastError);
+                throw new RuntimeException('AI model could not transcribe an answer page after two attempts.', previous: $lastError);
             }
 
             $reportedActive = $result['activeQuestionNumber'] ?? null;
@@ -493,15 +493,15 @@ class TestAssessmentService
         $start = strpos($response, '{');
         $end = strrpos($response, '}');
         if ($start === false || $end === false || $end < $start) {
-            throw new RuntimeException("Ollama returned invalid {$purpose} JSON.");
+            throw new RuntimeException("AI model returned invalid {$purpose} JSON.");
         }
         try {
             $decoded = json_decode(substr($response, $start, $end - $start + 1), true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $error) {
-            throw new RuntimeException("Ollama returned invalid {$purpose} JSON.", previous: $error);
+            throw new RuntimeException("AI model returned invalid {$purpose} JSON.", previous: $error);
         }
         if (!is_array($decoded)) {
-            throw new RuntimeException("Ollama returned invalid {$purpose} JSON.");
+            throw new RuntimeException("AI model returned invalid {$purpose} JSON.");
         }
 
         return $decoded;
@@ -704,7 +704,7 @@ class TestAssessmentService
 
         foreach ($messages as $message) {
             if (preg_match(
-                '/^(?:Ollama (?:Cloud is not configured|chat provider (?:is unavailable|rejected the request|returned no answer)|could not transcribe an answer page after two attempts)|AI grading is busy|grading is busy|grading queue is unavailable)/i',
+                '/^(?:(?:AI chat provider is not configured|AI chat provider (?:is unavailable|rejected the request|returned no answer)|AI model could not transcribe an answer page after two attempts)|Ollama (?:Cloud is not configured|chat provider (?:is unavailable|rejected the request|returned no answer)|could not transcribe an answer page after two attempts)|AI grading is busy|grading is busy|grading queue is unavailable)/i',
                 $message
             ) === 1) {
                 return true;

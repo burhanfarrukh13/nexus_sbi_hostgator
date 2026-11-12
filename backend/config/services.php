@@ -9,7 +9,8 @@ return [
         'timeout' => (int) env('OPENROUTER_TIMEOUT_SECONDS', 30),
     ],
     'ai_chat' => [
-        'url' => env('OLLAMA_API_URL', 'https://ollama.com/v1/chat/completions'),
+        // Keep the legacy OLLAMA_* environment keys so existing deployments continue to work.
+        'url' => env('OLLAMA_API_URL', 'https://openrouter.ai/api/v1/chat/completions'),
         'key' => env('OLLAMA_API_KEY'),
         'model' => env('OLLAMA_MODEL'),
         'timeout' => (int) env('OLLAMA_TIMEOUT_SECONDS', 300),

@@ -66,7 +66,7 @@ Notebook questions are limited to 15 successful answers per student per day by d
 
 Notebook chat runs at most eight provider requests at once by default (`NOTEBOOK_MAX_CONCURRENT`). If all slots are occupied, the request is stored as a private, owner-scoped FIFO ticket and returns `202` with only `retryAfterSeconds`; the browser retries the same `clientRequestId` without clearing the question. Pending tickets expire after two minutes without an owner recheck. Completed retries return the stored response, while provider failures keep the ticket and refund the daily reservation. Queued photos are stored outside the web root with private file permissions.
 
-Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollama Cloud model. Students can change their response language and personal prompt without changing the subject default. Configure `OPENROUTER_API_KEY`, `OPENROUTER_EMBEDDINGS_MODEL`, and `OPENROUTER_EMBEDDINGS_DIMENSIONS`, plus `OLLAMA_API_KEY` and `OLLAMA_MODEL`, in the backend environment. The supported starting configuration is `openai/text-embedding-3-small` with 1536 dimensions and Ollama's OpenAI-compatible `/v1/chat/completions` endpoint. Keys must not be added to the React build. If a chat provider request fails, its ticket is retained for retry rather than returning a fabricated answer. Sources created before embeddings were configured can be upgraded with `php artisan ai-notebook:reindex-embeddings`.
+Notebook indexing and chat use OpenRouter's OpenAI-compatible APIs. Students can change their response language and personal prompt without changing the subject default. Configure `OPENROUTER_API_KEY`, `OPENROUTER_EMBEDDINGS_MODEL`, and `OPENROUTER_EMBEDDINGS_DIMENSIONS` for embeddings. Chat settings are read from the legacy `OLLAMA_API_URL`, `OLLAMA_API_KEY`, and `OLLAMA_MODEL` names; set the URL to `https://openrouter.ai/api/v1/chat/completions` and use a vision-capable model for photos and scanned answers. The supported embedding configuration is `openai/text-embedding-3-small` with 1536 dimensions. Keys must not be added to the React build. If a chat provider request fails, its ticket is retained for retry rather than returning a fabricated answer. Sources created before embeddings were configured can be upgraded with `php artisan ai-notebook:reindex-embeddings`.
 
 ## Analytics
 
@@ -90,7 +90,7 @@ Notebook indexing requires OpenRouter embeddings; chat uses the configured Ollam
 | `GET /api/tests/me/attempts` | List the authenticated student's tests and attempt state. |
 | `GET /api/tests/{id}/me` | Load a test with student-safe question fields. |
 | `POST /api/tests/{id}/me/request-access` | Request a deadline extension after expiry. |
-| `POST /api/tests/{id}/me/submit` | Store submitted answers/files, then assess readable text answers with the configured Ollama model. |
+| `POST /api/tests/{id}/me/submit` | Store submitted answers/files, then assess readable text answers with the configured OpenAI-compatible AI model. |
 | `POST /api/tests/{id}/me/attempts/{attemptId}/resubmit` | Retry assessment of a saved failed attempt. |
 | `POST /api/tests/{id}/me/review` | Submit a 1–4000 character review request for a completed result. |
 | `GET /api/tests/{id}/me/attempt-files/{fileId}/pages[/{pageNumber}]` | Read/render the student's own submission pages. |
