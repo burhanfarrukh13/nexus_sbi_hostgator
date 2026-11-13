@@ -24,6 +24,7 @@ class AiNotebookDailyLimitTest extends TestCase
     {
         parent::setUp();
         [$this->subjectId] = $this->createTest();
+        $this->addNotebookSource();
         $this->studentId = $this->createUser();
         $this->grantSubject($this->studentId, $this->subjectId);
         $this->chatClient = new class extends CloudChatClient {
@@ -186,5 +187,31 @@ class AiNotebookDailyLimitTest extends TestCase
         self::assertSame(15, (int) DB::table('ai_notebook_daily_usage')
             ->where('userId', $adminId)
             ->value('requestCount'));
+    }
+
+    private function addNotebookSource(): void
+    {
+        $sourceId = (string) Str::uuid();
+        DB::table('ai_notebook_sources')->insert([
+            'id' => $sourceId,
+            'subject_id' => $this->subjectId,
+            'title' => 'Notebook test source',
+            'original_name' => 'notebook.txt',
+            'mime_type' => 'text/plain',
+            'storage_key' => 'test/notebook.txt',
+            'status' => 'ready',
+            'total_chunks' => 1,
+            'completed_chunks' => 1,
+            'created_at' => now(),
+        ]);
+        DB::table('ai_notebook_chunks')->insert([
+            'id' => (string) Str::uuid(),
+            'source_id' => $sourceId,
+            'ordinal' => 0,
+            'content' => 'Another question. Why? Before midnight. At the limit. After midnight. Can staff use the Notebook. One too many.',
+            'embedding' => '[]',
+            'embedding_model' => 'lexical',
+            'created_at' => now(),
+        ]);
     }
 }

@@ -257,7 +257,7 @@ return new class extends Migration
 
         DB::table('ai_grading_settings')->insert([
             'id' => 1,
-            'deficiency_report_prompt' => 'Review the student work fairly, highlight the strongest points first, then identify the main gaps with clear, actionable guidance.',
+            'deficiency_report_prompt' => 'Address the student directly using you and your. Highlight your strongest points first, then identify the main gaps with clear, actionable guidance.',
             'result_release_delay_hours' => 0,
             'notebook_daily_question_limit' => 15,
             'updated_at' => now(),

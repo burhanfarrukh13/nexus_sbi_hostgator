@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Throwable;
 
@@ -69,6 +70,16 @@ class CloudChatClient
         }
         if (!$response->successful()) {
             throw new RuntimeException('AI chat provider rejected the request.');
+        }
+
+        if ($jsonResponse && $maxTokens !== null) {
+            Log::info('AI structured response metadata.', [
+                'model' => $model,
+                'finishReason' => $response->json('choices.0.finish_reason'),
+                'promptTokens' => $response->json('usage.prompt_tokens'),
+                'completionTokens' => $response->json('usage.completion_tokens'),
+                'maxTokens' => $payload['max_tokens'],
+            ]);
         }
 
         $content = $response->json('choices.0.message.content');

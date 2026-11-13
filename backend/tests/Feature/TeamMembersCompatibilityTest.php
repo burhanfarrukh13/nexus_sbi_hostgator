@@ -264,9 +264,9 @@ class TeamMembersCompatibilityTest extends TestCase
             ->assertJsonPath('message', 'Use the self-service password change flow for your own account');
     }
 
-    public function test_scoped_password_manager_can_reset_only_students_in_assigned_subjects(): void
+    public function test_subject_scoped_team_member_can_reset_only_students_in_assigned_subjects(): void
     {
-        $actor = $this->createUser('scoped.manager@example.test', 'admin', ['password_manager']);
+        $actor = $this->createUser('scoped.manager@example.test', 'admin', ['teacher_assistant']);
         $allowedStudent = $this->createUser('allowed.student@example.test', 'student');
         $otherStudent = $this->createUser('other.student@example.test', 'student');
         $allowedSubject = (string) Str::uuid();
@@ -300,6 +300,15 @@ class TeamMembersCompatibilityTest extends TestCase
         ]);
         $token = $this->token($actor);
 
+        $this->withToken($token)
+            ->getJson('/api/auth/me')
+            ->assertOk()
+            ->assertJsonPath('subjectIds.0', $allowedSubject);
+        $this->withToken($token)
+            ->getJson('/api/users/search?email=student')
+            ->assertOk()
+            ->assertJsonCount(1)
+            ->assertJsonPath('0.id', $allowedStudent);
         $this->withToken($token)
             ->putJson('/api/team-members/'.$allowedStudent.'/password', [
                 'newPassword' => 'allowed-student-password',

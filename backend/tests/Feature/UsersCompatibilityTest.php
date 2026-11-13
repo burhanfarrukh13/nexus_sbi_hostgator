@@ -144,6 +144,113 @@ class UsersCompatibilityTest extends TestCase
             ->assertExactJson([]);
     }
 
+    public function test_user_manager_can_edit_student_details_without_changing_subject_access_or_password(): void
+    {
+        $manager = $this->createUser('manager@example.test', 'admin', ['user_manager']);
+        $student = $this->createUser('student@example.test', 'student');
+        $originalHash = DB::table('users')->where('id', $student)->value('password');
+        $subjectId = (string) Str::uuid();
+        DB::table('subjects')->insert([
+            'id' => $subjectId,
+            'code' => 'EDIT-1',
+            'name' => 'Editable subject',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        DB::table('subject_user_access')->insert([
+            'subject_id' => $subjectId,
+            'user_id' => $student,
+            'created_at' => now(),
+        ]);
+
+        $this->withToken($this->token($manager))
+            ->putJson("/api/users/{$student}", [
+                'fullName' => 'Updated Student',
+                'email' => 'updated.student@example.test',
+                'phone' => '+1-555-0222',
+                'crn' => 'CRN-2026-EDIT',
+            ])
+            ->assertOk()
+            ->assertJsonPath('id', $student)
+            ->assertJsonPath('fullName', 'Updated Student')
+            ->assertJsonPath('email', 'updated.student@example.test')
+            ->assertJsonPath('phone', '+1-555-0222')
+            ->assertJsonPath('studentId', 'CRN-2026-EDIT');
+
+        $this->assertDatabaseHas('users', [
+            'id' => $student,
+            'fullName' => 'Updated Student',
+            'email' => 'updated.student@example.test',
+            'phone' => '+1-555-0222',
+            'studentId' => 'CRN-2026-EDIT',
+        ]);
+        $this->assertSame($originalHash, DB::table('users')->where('id', $student)->value('password'));
+        $this->assertDatabaseHas('subject_user_access', [
+            'subject_id' => $subjectId,
+            'user_id' => $student,
+        ]);
+        $this->assertDatabaseHas('audit_logs', [
+            'event' => 'student_account_updated',
+            'userId' => $manager,
+        ]);
+    }
+
+    public function test_student_detail_edits_validate_unique_email_and_crn(): void
+    {
+        $manager = $this->createUser('manager@example.test', 'admin', ['user_manager']);
+        $student = $this->createUser('student@example.test', 'student');
+        $otherStudent = $this->createUser('other@example.test', 'student');
+
+        $this->withToken($this->token($manager))
+            ->putJson("/api/users/{$student}", [
+                'fullName' => 'Student Name',
+                'email' => 'other@example.test',
+                'phone' => '+1-555-0222',
+                'crn' => DB::table('users')->where('id', $otherStudent)->value('studentId'),
+            ])
+                ->assertStatus(400)
+                ->assertJsonPath('error', 'Bad Request');
+    }
+
+    public function test_user_manager_cannot_edit_a_student_outside_assigned_subjects(): void
+    {
+        $manager = $this->createUser('manager@example.test', 'admin', ['user_manager']);
+        $subjectIds = [(string) Str::uuid(), (string) Str::uuid()];
+        foreach ($subjectIds as $index => $subjectId) {
+            DB::table('subjects')->insert([
+                'id' => $subjectId,
+                'code' => 'SCOPE-'.$index,
+                'name' => 'Scope '.$index,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
+        DB::table('team_member_subject_access')->insert([
+            'user_id' => $manager,
+            'subject_id' => $subjectIds[0],
+        ]);
+        $student = $this->createUser('student.outside@example.test', 'student');
+        DB::table('subject_user_access')->insert([
+            'subject_id' => $subjectIds[1],
+            'user_id' => $student,
+            'created_at' => now(),
+        ]);
+
+        $this->withToken($this->token($manager))
+            ->putJson("/api/users/{$student}", [
+                'fullName' => 'Changed Name',
+                'email' => 'changed@example.test',
+                'phone' => '+1-555-0222',
+                'crn' => 'CRN-CHANGED',
+            ])
+            ->assertForbidden();
+
+        $this->assertDatabaseHas('users', [
+            'id' => $student,
+            'email' => 'student.outside@example.test',
+        ]);
+    }
+
     private function createUser(string $email, string $role, array $permissions = []): string
     {
         $id = (string) Str::uuid();

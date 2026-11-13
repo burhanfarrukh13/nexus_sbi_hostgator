@@ -370,7 +370,8 @@ class TeamMembersService
         $permissions = $this->getPermissions($userId);
 
         return in_array('admin', $permissions, true) ||
-            in_array('password_manager', $permissions, true);
+            in_array('password_manager', $permissions, true) ||
+            $this->subjectAccess->isScopedTeamMember($userId);
     }
 
     private function requireUser(string $userId): object

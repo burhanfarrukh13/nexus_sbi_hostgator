@@ -79,7 +79,7 @@ class StaleAttemptRecoveryTest extends TestCase
         self::assertNull($attempt->grading_error);
     }
 
-    public function test_finished_and_failed_papers_are_not_touched(): void
+    public function test_completed_papers_are_untouched_and_failed_papers_are_requeued(): void
     {
         $completed = $this->insertAttempt($this->testId, ['status' => 'COMPLETED', 'updatedMinutesAgo' => 600]);
         $failed = $this->insertAttempt($this->testId, [
@@ -88,11 +88,27 @@ class StaleAttemptRecoveryTest extends TestCase
             'gradingError' => 'Original failure reason.',
         ]);
 
-        self::assertSame(0, app(TestAssessmentService::class)->recoverStaleAttempts());
+        self::assertSame(1, app(TestAssessmentService::class)->recoverStaleAttempts());
 
         self::assertSame('COMPLETED', $this->statusOf($completed));
-        self::assertSame('FAILED', $this->statusOf($failed));
-        self::assertSame('Original failure reason.', DB::table('test_attempts')->where('id', $failed)->value('grading_error'));
+        self::assertSame('SUBMITTED', $this->statusOf($failed));
+        self::assertNull(DB::table('test_attempts')->where('id', $failed)->value('grading_error'));
+    }
+
+    public function test_failed_papers_after_automatic_retry_remain_visible_for_admin_review(): void
+    {
+        $attemptId = $this->insertAttempt($this->testId, [
+            'status' => 'FAILED',
+            'gradingError' => 'Automated grading could not complete after an automatic retry. Administrator review is required.',
+            'gradingAttempts' => 2,
+        ]);
+
+        self::assertSame(0, app(TestAssessmentService::class)->recoverStaleAttempts());
+        self::assertSame('FAILED', $this->statusOf($attemptId));
+        self::assertSame(
+            'Automated grading could not complete after an automatic retry. Administrator review is required.',
+            DB::table('test_attempts')->where('id', $attemptId)->value('grading_error')
+        );
     }
 
     public function test_the_window_comes_from_config_and_cannot_be_set_below_ten_minutes(): void
@@ -118,7 +134,7 @@ class StaleAttemptRecoveryTest extends TestCase
         $this->useChat(ScriptedChatClient::always($this->gradedAnswer()));
 
         $this->artisan('ai-tests:grade-pending')
-            ->expectsOutputToContain('Recovered 1 stuck grading attempt')
+            ->expectsOutputToContain('Recovered 1 grading attempt(s) for retry.')
             ->assertExitCode(0);
 
         self::assertSame('COMPLETED', $this->statusOf($attemptId));

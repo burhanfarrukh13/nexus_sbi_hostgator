@@ -173,6 +173,48 @@ class UsersService
         ];
     }
 
+    public function updateStudent(string $userId, array $data, string $actorId): array
+    {
+        $email = mb_strtolower(trim($data['email']));
+        $fullName = trim($data['fullName']);
+        $phone = trim($data['phone']);
+        $crn = trim($data['crn']);
+
+        DB::transaction(function () use ($userId, $actorId, $email, $fullName, $phone, $crn): void {
+            $student = DB::table('users')
+                ->where('id', $userId)
+                ->where('role', 'student')
+                ->lockForUpdate()
+                ->first();
+            if (!$student) {
+                throw new \Symfony\Component\HttpKernel\Exception\NotFoundHttpException('Student not found.');
+            }
+
+            DB::table('users')->where('id', $userId)->update([
+                'fullName' => $fullName,
+                'email' => $email,
+                'phone' => $phone,
+                'studentId' => $crn,
+                'updatedAt' => now(),
+            ]);
+            DB::table('audit_logs')->insert([
+                'id' => (string) Str::uuid(),
+                'event' => 'student_account_updated',
+                'details' => 'Student account details updated',
+                'userId' => $actorId,
+                'metadata' => json_encode([
+                    'studentId' => $userId,
+                    'updatedFields' => ['fullName', 'email', 'phone', 'crn'],
+                ], JSON_THROW_ON_ERROR),
+                'createdAt' => now(),
+            ]);
+        });
+
+        return $this->basicUser(DB::table('users')
+            ->where('id', $userId)
+            ->first(['id', 'email', 'role', 'studentId', 'fullName', 'phone']));
+    }
+
     public function searchByEmail(string $fragment, int $limit = 25, ?string $role = null, ?string $adminId = null): array
     {
         $safe = mb_strtolower(trim($fragment));

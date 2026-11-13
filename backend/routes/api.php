@@ -50,7 +50,7 @@ Route::middleware(['auth.compat', 'throttle:authenticated-api'])->prefix('team-m
     Route::put('/{userId}/permissions', [TeamMembersController::class, 'updatePermissions'])
         ->middleware('permission.compat:admin');
     Route::put('/{userId}/password', [TeamMembersController::class, 'changePassword'])
-        ->middleware('permission.compat:admin|password_manager');
+        ->middleware('permission.compat:admin|password_manager|teacher_assistant|user_manager|testing_manager|student_query');
 });
 
 Route::middleware(['auth.compat', 'throttle:authenticated-api'])->prefix('student-queries')->group(function (): void {
@@ -69,10 +69,12 @@ Route::middleware(['auth.compat', 'throttle:authenticated-api', 'permission.comp
 
 Route::middleware(['auth.compat', 'throttle:authenticated-api'])->prefix('users')->group(function (): void {
     Route::get('/search', [UsersController::class, 'search'])
-        ->middleware('permission.compat:admin|password_manager|user_manager');
+        ->middleware('permission.compat:admin|password_manager|user_manager|teacher_assistant|testing_manager|student_query');
     Route::get('', [UsersController::class, 'index'])
         ->middleware('permission.compat:admin|user_manager|password_manager');
     Route::post('', [UsersController::class, 'store'])
+        ->middleware('permission.compat:admin|user_manager');
+    Route::put('/{userId}', [UsersController::class, 'updateStudent'])
         ->middleware('permission.compat:admin|user_manager');
     Route::put('/{userId}/subjects', [UsersController::class, 'updateSubjects'])
         ->middleware('permission.compat:admin|user_manager');

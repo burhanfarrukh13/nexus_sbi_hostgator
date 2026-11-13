@@ -27,6 +27,7 @@ class AiNotebookChatQueueTest extends TestCase
         parent::setUp();
         $this->useTemporaryPrivateStorage();
         [$this->subjectId] = $this->createTest();
+        $this->addNotebookSource();
         $this->firstStudentId = $this->createUser();
         $this->secondStudentId = $this->createUser();
         $this->grantSubject($this->firstStudentId, $this->subjectId);
@@ -287,6 +288,32 @@ class AiNotebookChatQueueTest extends TestCase
     {
         return $this->withToken($this->token($userId))->postJson('/api/ai-notebook/chat', [
             'clientRequestId' => $requestId,
+        ]);
+    }
+
+    private function addNotebookSource(): void
+    {
+        $sourceId = (string) Str::uuid();
+        DB::table('ai_notebook_sources')->insert([
+            'id' => $sourceId,
+            'subject_id' => $this->subjectId,
+            'title' => 'Notebook test source',
+            'original_name' => 'notebook.txt',
+            'mime_type' => 'text/plain',
+            'storage_key' => 'test/notebook.txt',
+            'status' => 'ready',
+            'total_chunks' => 1,
+            'completed_chunks' => 1,
+            'created_at' => now(),
+        ]);
+        DB::table('ai_notebook_chunks')->insert([
+            'id' => (string) Str::uuid(),
+            'source_id' => $sourceId,
+            'ordinal' => 0,
+            'content' => 'First question. Second question. Still waiting. Explain this topic. Keep this question. Another question. Do not lose this question. Private question. Analyze the attached photo using relevant information from this subject notebook.',
+            'embedding' => '[]',
+            'embedding_model' => 'lexical',
+            'created_at' => now(),
         ]);
     }
 }

@@ -73,20 +73,20 @@ class GradePendingTestAttempts extends Command
         try {
             $recovered = $assessment->recoverStaleAttempts();
             if ($recovered > 0) {
-                $this->warn("Recovered {$recovered} stuck grading attempt(s).");
+                $this->warn("Recovered {$recovered} grading attempt(s) for retry.");
             }
 
             while (($limit === 0 || $graded + $failed + $requeued < $limit)
                 && microtime(true) - $startedAt < $maxSeconds) {
                 $this->heartbeat('running');
-                // Submissions that have not been tried yet go first, then the oldest.
+                // Give retries priority, then preserve oldest-first order within that group.
                 $candidates = DB::table('test_attempts')
                     ->where('status', 'SUBMITTED')
                     ->whereNull('grading_error')
                     ->whereNotNull('submitted_at')
                     ->where('updatedAt', '<=', now())
                     ->when($seen !== [], fn ($query) => $query->whereNotIn('id', array_keys($seen)))
-                    ->orderBy('grading_attempts')
+                    ->orderByDesc('grading_attempts')
                     ->orderBy('submitted_at')
                     ->limit(5)
                     ->get(['id', 'testId']);

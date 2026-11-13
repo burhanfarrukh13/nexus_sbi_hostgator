@@ -62,7 +62,7 @@ class GradePendingCommandTest extends TestCase
         self::assertSame('SUBMITTED', $this->statusOf($third));
     }
 
-    public function test_untried_submissions_go_before_retries_and_then_the_oldest_first(): void
+    public function test_retries_go_before_untried_submissions_and_then_the_oldest_first(): void
     {
         [, $testId] = $this->createTest();
         $retry = $this->insertAttempt($testId, ['submittedMinutesAgo' => 60, 'gradingAttempts' => 1]);
@@ -72,12 +72,12 @@ class GradePendingCommandTest extends TestCase
 
         $this->artisan('ai-tests:grade-pending --limit=2')->assertExitCode(0);
 
+        self::assertSame('COMPLETED', $this->statusOf($retry));
         self::assertSame('COMPLETED', $this->statusOf($older));
-        self::assertSame('COMPLETED', $this->statusOf($newer));
-        self::assertSame('SUBMITTED', $this->statusOf($retry));
+        self::assertSame('SUBMITTED', $this->statusOf($newer));
     }
 
-    public function test_only_waiting_submissions_are_picked_up(): void
+    public function test_existing_failed_attempts_are_automatically_rechecked(): void
     {
         [, $testId] = $this->createTest();
         $processing = $this->insertAttempt($testId, ['status' => 'PROCESSING']);
@@ -87,13 +87,14 @@ class GradePendingCommandTest extends TestCase
         $this->useChat($chat);
 
         $this->artisan('ai-tests:grade-pending')
-            ->expectsOutputToContain('Graded 0')
+            ->expectsOutputToContain('Recovered 1 grading attempt(s) for retry.')
+            ->expectsOutputToContain('Graded 1, failed 0, requeued 0')
             ->assertExitCode(0);
 
         self::assertSame('PROCESSING', $this->statusOf($processing));
-        self::assertSame('FAILED', $this->statusOf($failed));
+        self::assertSame('COMPLETED', $this->statusOf($failed));
         self::assertSame('COMPLETED', $this->statusOf($completed));
-        self::assertSame([], $chat->calls);
+        self::assertCount(1, $chat->calls);
     }
 
     public function test_a_scanned_pdf_is_rendered_transcribed_and_graded(): void
@@ -144,13 +145,17 @@ class GradePendingCommandTest extends TestCase
         $this->useRenderer(null);
         $this->useChat(ScriptedChatClient::always($this->gradedAnswer()));
 
-        // One failed paper makes the run report a failure, but the next paper is still graded.
+        // Even a non-provider failure is automatically requeued; other submissions still proceed.
         $this->artisan('ai-tests:grade-pending')
-            ->expectsOutputToContain('Graded 1, failed 1, requeued 0')
-            ->assertExitCode(1);
+            ->expectsOutputToContain('Graded 1, failed 0, requeued 1')
+            ->assertExitCode(0);
 
-        self::assertSame('FAILED', $this->statusOf($scanned));
-        self::assertNotNull(DB::table('test_attempts')->where('id', $scanned)->value('grading_error'));
+        self::assertSame('SUBMITTED', $this->statusOf($scanned));
+        self::assertNull(DB::table('test_attempts')->where('id', $scanned)->value('grading_error'));
+        self::assertTrue(
+            \Illuminate\Support\Carbon::parse(DB::table('test_attempts')->where('id', $scanned)->value('updatedAt'))
+                ->greaterThan(now())
+        );
         self::assertSame('COMPLETED', $this->statusOf($typed));
     }
 
@@ -201,6 +206,26 @@ class GradePendingCommandTest extends TestCase
         self::assertTrue(
             \Illuminate\Support\Carbon::parse(DB::table('test_attempts')->where('id', $attemptId)->value('updatedAt'))
                 ->greaterThan(now())
+        );
+    }
+
+    public function test_non_provider_failures_get_one_automatic_retry_then_remain_for_review(): void
+    {
+        [, $testId] = $this->createTest();
+        $attemptId = $this->insertAttempt($testId, [
+            'status' => 'FAILED',
+            'gradingError' => 'The marking scheme is invalid.',
+            'gradingAttempts' => 2,
+        ]);
+
+        self::assertFalse(
+            app(\App\Services\TestAssessmentService::class)
+                ->requeueAfterBackgroundFailure($attemptId, 'The marking scheme is invalid.')
+        );
+        self::assertSame('FAILED', $this->statusOf($attemptId));
+        self::assertSame(
+            'Automated grading could not complete after an automatic retry. Administrator review is required.',
+            DB::table('test_attempts')->where('id', $attemptId)->value('grading_error')
         );
     }
 

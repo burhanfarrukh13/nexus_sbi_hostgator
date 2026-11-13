@@ -54,7 +54,7 @@ DEALLOCATE PREPARE add_result_release_delay_stmt;
 INSERT IGNORE INTO `ai_grading_settings`
   (`id`, `deficiency_report_prompt`, `result_release_delay_hours`)
 VALUES
-  (1, 'Review the student work fairly, highlight the strongest points first, then identify the main gaps with clear, actionable guidance.', 0);
+  (1, 'Address the student directly using you and your. Highlight your strongest points first, then identify the main gaps with clear, actionable guidance.', 0);
 
 UPDATE `ai_grading_settings`
 SET `result_release_delay_hours` = 0

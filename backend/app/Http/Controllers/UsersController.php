@@ -100,11 +100,35 @@ class UsersController
         ));
     }
 
+    public function updateStudent(Request $request, string $userId): JsonResponse
+    {
+        $this->validateUuid($userId);
+        $input = $this->validateBody($request, [
+            'fullName' => ['required', 'string', 'min:2', 'max:200'],
+            'email' => ['required', 'string', 'email:rfc', 'min:3', 'max:254', Rule::unique('users', 'email')->ignore($userId, 'id')],
+            'phone' => ['required', 'string', 'min:7', 'max:32'],
+            'crn' => ['required', 'string', 'min:1', 'max:32', Rule::unique('users', 'studentId')->ignore($userId, 'id')],
+        ]);
+        $identity = $request->attributes->get('apiIdentity');
+        $this->subjectAccess->assertStudentAccessible((string) $identity['userId'], $userId);
+
+        return response()->json($this->users->updateStudent($userId, $input, (string) $identity['userId']));
+    }
+
     public function search(Request $request): JsonResponse
     {
         $identity = $request->attributes->get('apiIdentity');
         $permissions = $identity['adminPermissions'] ?? [];
-        $role = in_array('admin', $permissions, true) ? null : 'student';
+        $isSuperAdmin = in_array('admin', $permissions, true);
+        $isScopedTeamMember = ($identity['role'] ?? null) === 'admin' &&
+            $this->subjectAccess->isScopedTeamMember((string) $identity['userId']);
+        if (!$isSuperAdmin &&
+            !in_array('password_manager', $permissions, true) &&
+            !in_array('user_manager', $permissions, true) &&
+            !$isScopedTeamMember) {
+            throw new AccessDeniedHttpException('You do not have permission to search accounts.');
+        }
+        $role = $isSuperAdmin ? null : 'student';
         $adminId = ($identity['role'] ?? null) === 'admin' && $role === 'student'
             ? (string) $identity['userId']
             : null;

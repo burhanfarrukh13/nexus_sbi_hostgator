@@ -5,7 +5,7 @@ type AssetRecord = {
   key: string;
   userId: string;
   url: string;
-  revision: string | null;
+  revision: string;
   kind: AssetKind;
   cachedAt: number;
   lastUsedAt: number;
@@ -16,77 +16,25 @@ type AssetRecord = {
 const DATABASE_NAME = "nexus-student-test-assets";
 const DATABASE_VERSION = 1;
 const STORE_NAME = "assets";
-const REVISION_STORAGE_PREFIX = "nexus.test-assets.revision.v1:";
-const MAX_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_CACHE_BYTES = 50 * 1024 * 1024;
-const MAX_ASSET_BYTES = 12 * 1024 * 1024;
 const recordsInFlight = new Map<string, Promise<AssetRecord | undefined>>();
 const fetchesInFlight = new Map<string, Promise<Blob | number>>();
 let cacheUserId: string | null = null;
-let cacheRevision: string | null = null;
 let databasePromise: Promise<IDBDatabase> | undefined;
 
-function revisionStorageKey(userId: string) {
-  return `${REVISION_STORAGE_PREFIX}${encodeURIComponent(userId)}`;
-}
-
-function assetKey(userId: string, url: string, kind: AssetKind) {
-  return `${userId}|${kind}|${url}`;
+function assetKey(userId: string, url: string, kind: AssetKind, revision: string) {
+  return `${userId}|${kind}|${url}|${revision}`;
 }
 
 export function setTestAssetCacheUser(userId: string | null) {
   if (userId === cacheUserId) return;
-  if (cacheUserId && userId) {
-    void deleteUserTestAssets(cacheUserId);
-  }
   cacheUserId = userId;
-  cacheRevision = null;
-  if (userId) {
-    try {
-      cacheRevision = localStorage.getItem(revisionStorageKey(userId));
-    } catch {
-      cacheRevision = null;
-    }
-  }
   recordsInFlight.clear();
   fetchesInFlight.clear();
 }
 
-export function setTestAssetCacheRevision(revision: string | null) {
-  if (!cacheUserId || revision === null) return;
-  const userId = cacheUserId;
-  if (cacheRevision !== revision) {
-    cacheRevision = revision;
-    recordsInFlight.clear();
-    fetchesInFlight.clear();
-    void deleteUserTestAssets(userId);
-  }
-  try {
-    localStorage.setItem(revisionStorageKey(userId), revision);
-  } catch {
-    // The persistent cache stays optional if local storage is unavailable.
-  }
-}
-
-export function clearTestAssetCache() {
-  const userId = cacheUserId;
-  cacheUserId = null;
-  cacheRevision = null;
-  recordsInFlight.clear();
-  fetchesInFlight.clear();
-  if (userId) {
-    try {
-      localStorage.removeItem(revisionStorageKey(userId));
-    } catch {
-      // Continue clearing IndexedDB even when local storage is unavailable.
-    }
-    void deleteUserTestAssets(userId);
-  }
-}
-
-export function getTestPageCount(url: string): Promise<number> {
+export function getTestPageCount(url: string, revision: string): Promise<number> {
   const token = getToken();
-  return getOrFetchAsset(url, "page-info", async () => {
+  return getOrFetchAsset(url, "page-info", revision, async () => {
     const response = await authenticatedFetch(url, token);
     if (!response.ok) {
       throw new Error(`Could not load pages (${response.status}).`);
@@ -100,9 +48,9 @@ export function getTestPageCount(url: string): Promise<number> {
   });
 }
 
-export function getTestPageBlob(url: string): Promise<Blob> {
+export function getTestPageBlob(url: string, revision: string): Promise<Blob> {
   const token = getToken();
-  return getOrFetchAsset(url, "page", async () => {
+  return getOrFetchAsset(url, "page", revision, async () => {
     const response = await authenticatedFetch(url, token);
     if (!response.ok) {
       throw new Error(`Could not load original page (${response.status}).`);
@@ -122,11 +70,11 @@ async function authenticatedFetch(url: string, token: string | null) {
 function getOrFetchAsset<T extends Blob | number>(
   url: string,
   kind: AssetKind,
+  revision: string,
   fetchValue: () => Promise<T>,
 ): Promise<T> {
   const userId = cacheUserId;
-  const key = assetKey(userId ?? "anonymous", url, kind);
-  const revision = cacheRevision;
+  const key = assetKey(userId ?? "anonymous", url, kind, revision);
   const token = getToken();
   const pending = fetchesInFlight.get(key);
   if (pending) return pending as Promise<T>;
@@ -137,8 +85,6 @@ function getOrFetchAsset<T extends Blob | number>(
     if (
       userId !== null &&
       cacheUserId === userId &&
-      revision !== null &&
-      cacheRevision === revision &&
       token !== null &&
       getToken() === token
     ) {
@@ -160,6 +106,13 @@ function getOrFetchAsset<T extends Blob | number>(
 
 async function openDatabase(): Promise<IDBDatabase> {
   if (databasePromise) return databasePromise;
+  try {
+    if (navigator.storage?.persist) {
+      void navigator.storage.persist().catch(() => false);
+    }
+  } catch {
+    // Persistent browser storage is best-effort.
+  }
   const opening = new Promise<IDBDatabase>((resolve, reject) => {
     if (!("indexedDB" in window)) {
       reject(new Error("IndexedDB is unavailable."));
@@ -192,7 +145,7 @@ async function readAsset(
   userId: string | null,
   url: string,
   kind: AssetKind,
-  revision: string | null,
+  revision: string,
 ): Promise<AssetRecord | undefined> {
   const pending = recordsInFlight.get(key);
   if (pending) return pending;
@@ -221,8 +174,7 @@ async function readAsset(
         record.userId !== userId ||
         record.url !== url ||
         record.kind !== kind ||
-        record.revision !== revision ||
-        Date.now() - record.cachedAt > MAX_CACHE_AGE_MS
+        record.revision !== revision
       ) {
         if (record) void deleteAsset(key);
         return undefined;
@@ -246,29 +198,23 @@ async function writeAsset(
   url: string,
   kind: AssetKind,
   value: Blob | number,
-  revision: string | null,
+  revision: string,
 ) {
   const size = value instanceof Blob ? value.size : 0;
-  if (
-    size > MAX_ASSET_BYTES ||
-    cacheUserId !== userId ||
-    cacheRevision !== revision
-  ) {
-    return;
-  }
+  if (cacheUserId !== userId) return;
   try {
     const database = await openDatabase();
     const existing = await getUserAssets(database, userId);
-    let totalBytes = existing.reduce((sum, record) => sum + record.size, 0);
-    const ordered = existing
-      .filter((record) => record.key !== key)
-      .sort((left, right) => left.lastUsedAt - right.lastUsedAt);
-    while (totalBytes + size > MAX_CACHE_BYTES && ordered.length) {
-      const oldest = ordered.shift()!;
-      await deleteAsset(oldest.key);
-      totalBytes -= oldest.size;
+    for (const record of existing) {
+      if (
+        record.url === url &&
+        record.kind === kind &&
+        record.revision !== revision
+      ) {
+        await deleteAsset(record.key);
+      }
     }
-    if (totalBytes + size > MAX_CACHE_BYTES || cacheUserId !== userId) return;
+    if (cacheUserId !== userId) return;
     const now = Date.now();
     const record: AssetRecord = {
       key,
@@ -314,30 +260,6 @@ async function deleteAsset(key: string) {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(STORE_NAME, "readwrite");
       transaction.objectStore(STORE_NAME).delete(key);
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-    });
-  } catch {
-    // Cache cleanup must not prevent the student from continuing.
-  }
-}
-
-async function deleteUserTestAssets(userId: string) {
-  try {
-    const database = await openDatabase();
-    await new Promise<void>((resolve, reject) => {
-      const transaction = database.transaction(STORE_NAME, "readwrite");
-      const request = transaction
-        .objectStore(STORE_NAME)
-        .index("userId")
-        .openCursor(IDBKeyRange.only(userId));
-      request.onsuccess = () => {
-        const cursor = request.result;
-        if (cursor) {
-          cursor.delete();
-          cursor.continue();
-        }
-      };
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error);
     });

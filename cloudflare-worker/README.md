@@ -3,11 +3,10 @@
 This Cloudflare Worker eliminates AI Notebook concurrency starvation and protects your HostGator Business account.
 
 ### How it Works
-1. **Student Question Arrives at the Edge**: Cloudflare checks its Edge Cache. If an identical question was asked recently for that subject, the answer is returned **in 20ms** with zero server hits.
-2. **Context Retrieval**: If uncached, the Worker makes a 50ms API call to HostGator to fetch source chunk excerpts and check daily limits. The HostGator PHP process finishes and terminates immediately.
-3. **Direct AI Completion**: The Worker calls Ollama Cloud directly from Cloudflare's global edge network.
-4. **Zero PHP Processes Blocked**: Even if Ollama takes 20 to 45 seconds to generate an answer, **zero Entry Processes are held open on HostGator**.
-5. **Background Sync**: The completed conversation is asynchronously logged back to your Laravel database without making the student wait.
+1. **Source and permission check**: Every request reaches Laravel to validate access and retrieve current subject excerpts. Stale cached answers cannot bypass this check.
+2. **Grounding gate**: If no excerpt is sufficiently relevant, the Worker returns Laravel's fixed refusal and does not call the chat provider.
+3. **Direct AI Completion**: Only questions with relevant source excerpts are sent to the configured chat provider from Cloudflare's edge.
+4. **Background Sync**: The completed conversation is asynchronously logged back to your Laravel database without making the student wait.
 
 ---
 
@@ -21,9 +20,9 @@ This Cloudflare Worker eliminates AI Notebook concurrency starvation and protect
 6. Click **Save and Deploy**.
 7. Go to **Settings** > **Variables and Secrets**:
    * Add Variable: `LARAVEL_API_URL` = `https://api.yourdomain.com` (your HostGator API subdomain).
-   * Add Variable: `OLLAMA_API_URL` = `https://ollama.com/v1/chat/completions`
-   * Add Variable: `OLLAMA_MODEL` = `gemma4:31b`
-   * Add Secret: `OLLAMA_API_KEY` = `<your Ollama Cloud API Key>`
+   * Add Variable: `OLLAMA_API_URL` = `https://openrouter.ai/api/v1/chat/completions`
+   * Add Variable: `OLLAMA_MODEL` = `qwen/qwen3-vl-30b-a3b-instruct`
+   * Add Secret: `OLLAMA_API_KEY` = `<your OpenRouter API Key>`
 8. Copy your Worker URL (e.g. `https://nexus-ai-worker.<your-subdomain>.workers.dev`).
 
 ---
@@ -39,7 +38,7 @@ npm install
 # 2. Login to Cloudflare
 npx wrangler login
 
-# 3. Add your secret Ollama API Key
+# 3. Add your OpenRouter API Key
 npx wrangler secret put OLLAMA_API_KEY
 
 # 4. Deploy to Cloudflare Edge
@@ -63,3 +62,5 @@ Or using the deployment packaging script:
 ```
 
 *Note: If `VITE_AI_WORKER_URL` is omitted, the frontend gracefully falls back to the native HostGator backend chat endpoint.*
+
+After updating source-grounding behavior, deploy the Laravel API and this Worker. If the Worker is enabled, redeploy it even when its URL has not changed; it must read the API's `grounded` and `refusal` fields. The Worker no longer caches answers, so every question is checked against the current subject sources.

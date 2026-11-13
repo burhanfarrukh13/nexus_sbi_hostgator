@@ -195,7 +195,6 @@ async function appendAnswerFile(
   form.append("files[]", file, `${prefix}.${extension}`);
 }
 import {
-  clearTestAssetCache,
   getTestPageBlob,
   getTestPageCount,
   setTestAssetCacheUser,
@@ -225,6 +224,7 @@ type Person = {
   role?: string;
   studentId?: string;
   adminPermissions?: string[];
+  subjectIds?: string[];
   mustResetPassword?: boolean;
 };
 type Page =
@@ -810,6 +810,7 @@ type PageImageSource = {
   id: string;
   originalName: string;
   mimeType: string;
+  revision?: string;
   pageNumbers?: number[];
   displayPageNumber?: number;
 };
@@ -857,10 +858,12 @@ function PageImageGallery({
         }> = [];
         for (const file of supported) {
           const isImage = file.mimeType.startsWith("image/");
+          const revision = file.revision ?? file.id;
           const pageCount = isImage
             ? 1
             : await getTestPageCount(
                 `${API_BASE}${endpoint}/${file.id}/pages`,
+                revision,
               );
           if (cancelled) return;
           for (const pageNumber of new Set(file.pageNumbers ?? [])) {
@@ -876,6 +879,7 @@ function PageImageGallery({
               isImage
                 ? `${API_BASE}${endpoint}/${file.id}`
                 : `${API_BASE}${endpoint}/${file.id}/pages/${pageNumber}`,
+              revision,
             );
             if (cancelled) return;
             const url = URL.createObjectURL(blob);
@@ -968,12 +972,21 @@ function sourcePageImageFiles(
             id: getId(file),
             originalName: String(file.originalName ?? "Solution source"),
             mimeType: String(file.mimeType ?? ""),
+            revision: pageAssetRevision(file),
             pageNumbers,
           },
         ]
       : [];
   });
   return linkedFiles;
+}
+
+function pageAssetRevision(file: Data): string {
+  return [
+    getId(file),
+    String(file.sizeBytes ?? ""),
+    String(file.createdAt ?? ""),
+  ].join(":");
 }
 
 function addPdfFormattedContent(
@@ -1534,7 +1547,6 @@ function setResourceCacheUser(userId: string | null) {
 }
 
 function clearResourceCache() {
-  clearTestAssetCache();
   removePersistentTestResources();
   resourceCacheToken = getToken();
   resourceAuthGeneration += 1;
@@ -1805,8 +1817,11 @@ function App() {
     links = admin
       ? adminLinks.filter((link) => {
           if (permissions.has("admin")) return true;
+          if (link.id === "academic") return false;
+          if (link.id === "passwords") {
+            return permissions.has("password_manager") || Boolean(user.subjectIds?.length);
+          }
           const requiredPermissions: Partial<Record<Page, string[]>> = {
-            academic: ["teacher_assistant"],
             team: [],
             "test-admin": ["teacher_assistant", "testing_manager"],
             settings: ["admin"],
@@ -3140,6 +3155,7 @@ function TestAttempt({
                                   file.originalName ?? "Your answer",
                                 ),
                                 mimeType: String(file.mimeType ?? ""),
+                                revision: pageAssetRevision(file),
                                 ...(Array.isArray(
                                   questionResult.studentPageNumbers,
                                 )
@@ -5182,6 +5198,10 @@ function Students() {
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState("");
   const [notice, setNotice] = useState("");
+  const [editingStudentId, setEditingStudentId] = useState("");
+  const [studentDraft, setStudentDraft] = useState({ fullName: "", email: "", phone: "", crn: "" });
+  const [studentEditBusy, setStudentEditBusy] = useState(false);
+  const [studentEditError, setStudentEditError] = useState("");
   const filtered = students.filter((student) =>
     `${student.fullName ?? ""} ${student.email ?? ""} ${student.studentId ?? ""} ${student.phone ?? ""}`
       .toLowerCase()
@@ -5214,6 +5234,40 @@ function Students() {
       setFormError(ex instanceof Error ? ex.message : "Could not create student account.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  function startEditingStudent(student: Data) {
+    setEditingStudentId(getId(student));
+    setStudentDraft({
+      fullName: String(student.fullName ?? ""),
+      email: String(student.email ?? ""),
+      phone: String(student.phone ?? ""),
+      crn: String(student.studentId ?? ""),
+    });
+    setStudentEditError("");
+  }
+
+  async function saveStudent(event: FormEvent) {
+    event.preventDefault();
+    if (!editingStudentId) return;
+    setStudentEditBusy(true);
+    setStudentEditError("");
+    setNotice("");
+    try {
+      await api(`/users/${editingStudentId}`, json("PUT", {
+        fullName: studentDraft.fullName.trim(),
+        email: studentDraft.email.trim(),
+        phone: studentDraft.phone.trim(),
+        crn: studentDraft.crn.trim(),
+      }));
+      setEditingStudentId("");
+      setNotice("Student details updated.");
+      await refresh();
+    } catch (ex) {
+      setStudentEditError(ex instanceof Error ? ex.message : "Could not update student details.");
+    } finally {
+      setStudentEditBusy(false);
     }
   }
 
@@ -5256,12 +5310,42 @@ function Students() {
       <Card>
         <div className="card-heading"><div><h2>Student accounts</h2><p>{students.length} students</p></div></div>
         <label className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, email, CRN or phone" aria-label="Search students" /></label>
-        {loading ? <LoadingCard /> : filtered.length ? filtered.map((student) => (
-          <div className="source-row" key={getId(student)}>
-            <span className="row-icon"><Users size={16} /></span>
-            <div><b>{student.fullName || student.email || getId(student)}</b><small>{student.email} · CRN {student.studentId || "—"} · {student.phone || "No phone"}</small></div>
+        {loading ? <LoadingCard /> : filtered.length ? filtered.map((student) => {
+          const studentId = getId(student);
+          const isEditing = editingStudentId === studentId;
+          return (
+          <div className="subject-source-group" key={studentId}>
+            <div className="source-row">
+              <span className="row-icon"><Users size={16} /></span>
+              <div><b>{student.fullName || student.email || studentId}</b><small>{student.email} · CRN {student.studentId || "—"} · {student.phone || "No phone"}</small></div>
+              <button
+                className="button secondary small-button"
+                type="button"
+                onClick={() => isEditing ? setEditingStudentId("") : startEditingStudent(student)}
+              >
+                <Pencil size={14} /> {isEditing ? "Close" : "Edit"}
+              </button>
+            </div>
+            {isEditing && (
+              <form className="detail-card form-stack" onSubmit={(event) => void saveStudent(event)}>
+                {studentEditError && <ErrorBox error={studentEditError} />}
+                <div className="inline-fields">
+                  <label>Full name<input required minLength={2} maxLength={200} value={studentDraft.fullName} onChange={(event) => setStudentDraft((current) => ({ ...current, fullName: event.target.value }))} /></label>
+                  <label>CRN number<input required maxLength={32} value={studentDraft.crn} onChange={(event) => setStudentDraft((current) => ({ ...current, crn: event.target.value }))} /></label>
+                </div>
+                <div className="inline-fields">
+                  <label>Student email<input type="email" required maxLength={254} value={studentDraft.email} onChange={(event) => setStudentDraft((current) => ({ ...current, email: event.target.value }))} /></label>
+                  <label>Phone number<input type="tel" required minLength={7} maxLength={32} value={studentDraft.phone} onChange={(event) => setStudentDraft((current) => ({ ...current, phone: event.target.value }))} /></label>
+                </div>
+                <div className="button-row">
+                  <button className="button primary" disabled={studentEditBusy}>{studentEditBusy ? "Saving…" : "Save changes"}</button>
+                  <button className="button secondary" type="button" disabled={studentEditBusy} onClick={() => setEditingStudentId("")}>Cancel</button>
+                </div>
+              </form>
+            )}
           </div>
-        )) : <Empty title="No students found" detail="Create a student account or adjust the search." icon={Users} />}
+          );
+        }) : <Empty title="No students found" detail="Create a student account or adjust the search." icon={Users} />}
       </Card>
     </>
   );
@@ -6930,6 +7014,7 @@ function AttemptReview({
                     id: getId(file),
                     originalName,
                     mimeType: String(file.mimeType ?? ""),
+                    revision: pageAssetRevision(file),
                     pageNumbers: [1],
                     ...(pageMatch
                       ? { displayPageNumber: Number(pageMatch[1]) }
@@ -6937,13 +7022,15 @@ function AttemptReview({
                   };
                 });
               return uploadedPages.length ? (
-                <details className="admin-answer-pages">
-                  <summary>Preview all uploaded answer pages</summary>
+                <LazyDetails
+                  className="admin-answer-pages"
+                  summary="Preview all uploaded answer pages"
+                >
                   <PageImageGallery
                     endpoint={`/api/tests/${testId}/attempts/files`}
                     files={uploadedPages}
                   />
-                </details>
+                </LazyDetails>
               ) : null;
             })()}
           </section>
@@ -6968,10 +7055,10 @@ function AttemptReview({
                           {question.marksAwarded} / {question.marksAvailable}
                         </span>
                       </div>
-                      <details className="admin-answer-pages" open>
-                        <summary>
-                          View original question and ideal solution pages
-                        </summary>
+                      <LazyDetails
+                        className="admin-answer-pages"
+                        summary="View original question and ideal solution pages"
+                      >
                         <h5>Original question page</h5>
                         <PageImageGallery
                           endpoint={`/api/tests/${testId}/source-files`}
@@ -6994,10 +7081,12 @@ function AttemptReview({
                             "solutionSourceLocations",
                           )}
                         />
-                      </details>
+                      </LazyDetails>
                       {asArray<Data>(selectedAttempt.files).length > 0 && (
-                        <details className="admin-answer-pages">
-                          <summary>View your original answer page</summary>
+                        <LazyDetails
+                          className="admin-answer-pages"
+                          summary="View your original answer page"
+                        >
                           <PageImageGallery
                             endpoint={`/api/tests/${testId}/attempts/files`}
                             emptyMessage="No original answer page is mapped to this question."
@@ -7027,6 +7116,7 @@ function AttemptReview({
                                     id: getId(file),
                                     originalName,
                                     mimeType,
+                                    revision: pageAssetRevision(file),
                                     pageNumbers:
                                       pageNumber !== null
                                         ? studentPages.has(pageNumber)
@@ -7055,7 +7145,7 @@ function AttemptReview({
                               );
                             })()}
                           />
-                        </details>
+                        </LazyDetails>
                       )}
                       <FormattedContent
                         className="formatted-content"

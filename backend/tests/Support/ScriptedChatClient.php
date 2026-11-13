@@ -14,6 +14,9 @@ final class ScriptedChatClient extends CloudChatClient
     /** @var list<array> Every message list the grader sent, in order. */
     public array $calls = [];
 
+    /** @var list<?int> Output token budget for each provider call. */
+    public array $maxTokenRequests = [];
+
     /** @param Closure(array, int): (string|array) $responder Receives the messages and the 0-based call number. */
     public function __construct(private readonly Closure $responder)
     {
@@ -34,6 +37,7 @@ final class ScriptedChatClient extends CloudChatClient
     {
         $number = count($this->calls);
         $this->calls[] = $messages;
+        $this->maxTokenRequests[] = $maxTokens;
         $response = ($this->responder)($messages, $number);
 
         return is_array($response) ? json_encode($response, JSON_THROW_ON_ERROR) : $response;

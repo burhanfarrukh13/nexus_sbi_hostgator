@@ -16,12 +16,14 @@ return [
         'timeout' => (int) env('OLLAMA_TIMEOUT_SECONDS', 300),
         'notebook_timeout' => (int) env('OLLAMA_CHAT_TIMEOUT_SECONDS', 60),
         'notebook_max_tokens' => max(256, min(4096, (int) env('OLLAMA_CHAT_MAX_TOKENS', 2048))),
+        'grading_max_tokens' => max(1024, min(8192, (int) env('AI_GRADING_MAX_TOKENS', 8192))),
         'connect_timeout' => (int) env('OLLAMA_CONNECT_TIMEOUT_SECONDS', 15),
         'retry_delays' => [1, 3, 8],
     ],
     'ai_notebook' => [
         'day_reset_timezone' => env('AI_NOTEBOOK_DAY_RESET_TIMEZONE', 'Asia/Karachi'),
         'max_concurrent' => max(1, min(8, (int) env('NOTEBOOK_MAX_CONCURRENT', 8))),
+        'minimum_similarity' => max(0.0, min(1.0, (float) env('AI_NOTEBOOK_MIN_SOURCE_SIMILARITY', 0.30))),
     ],
     'grading' => [
         // Typed answers are queued for the background worker so web requests never

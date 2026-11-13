@@ -125,6 +125,37 @@ class OllamaChatClientTest extends TestCase
         self::assertFalse(isset($requests[2]['max_tokens']));
     }
 
+    public function test_structured_assessment_sends_requested_output_limit_and_logs_provider_metadata(): void
+    {
+        Http::fake([
+            'ollama.example.test/*' => Http::response([
+                'choices' => [[
+                    'message' => ['content' => '{"questions":[]}'],
+                    'finish_reason' => 'stop',
+                ]],
+                'usage' => ['prompt_tokens' => 120, 'completion_tokens' => 45],
+            ]),
+        ]);
+        \Illuminate\Support\Facades\Log::spy();
+
+        app(CloudChatClient::class)->complete([
+            ['role' => 'user', 'content' => 'Return a complete assessment.'],
+        ], true, null, 8192);
+
+        Http::assertSent(static fn ($request): bool =>
+            $request['response_format'] === ['type' => 'json_object'] &&
+            $request['max_tokens'] === 8192
+        );
+        \Illuminate\Support\Facades\Log::shouldHaveReceived('info')
+            ->once()
+            ->with('AI structured response metadata.', \Mockery::on(static fn (array $context): bool =>
+                $context['finishReason'] === 'stop' &&
+                $context['promptTokens'] === 120 &&
+                $context['completionTokens'] === 45 &&
+                $context['maxTokens'] === 8192
+            ));
+    }
+
     public function test_it_sends_image_content_to_a_vision_capable_model(): void
     {
         Config::set('services.ai_chat.model', 'qwen/qwen3-vl-30b-a3b-instruct');

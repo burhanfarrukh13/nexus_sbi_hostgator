@@ -103,7 +103,17 @@ class AuthController
 
     public function me(Request $request): JsonResponse
     {
-        return response()->json($request->attributes->get('apiIdentity'));
+        $identity = $request->attributes->get('apiIdentity');
+        if (($identity['role'] ?? null) === 'admin' &&
+            !in_array('admin', $identity['adminPermissions'] ?? [], true)) {
+            $identity['subjectIds'] = DB::table('team_member_subject_access')
+                ->where('user_id', $identity['userId'])
+                ->orderBy('subject_id')
+                ->pluck('subject_id')
+                ->all();
+        }
+
+        return response()->json($identity);
     }
 
     public function changePassword(Request $request): JsonResponse

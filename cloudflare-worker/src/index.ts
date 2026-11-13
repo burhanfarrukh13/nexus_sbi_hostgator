@@ -57,26 +57,7 @@ async function handleChat(request: Request, env: Env, ctx: ExecutionContext): Pr
   }
 
   const cleanQuestion = question.trim();
-  const normalizedKey = `${subjectId}:${cleanQuestion.toLowerCase()}:${studyAidMode || "standard"}`;
-
-  // 1. Edge Exact Caching (Serves identical questions in 0ms without hitting HostGator or Ollama)
-  const cacheKeyUrl = new URL(`https://cache.nexus.internal/${await sha256(normalizedKey)}`);
-  const cache = caches.default;
-  const cachedResponse = await cache.match(cacheKeyUrl.toString());
-  if (cachedResponse && !studyAidMode) {
-    const cachedData = await cachedResponse.json();
-    return jsonResponse(
-      {
-        ...cachedData,
-        sessionId: sessionId || cachedData.sessionId || crypto.randomUUID(),
-        cached: true,
-      },
-      200,
-      { "X-Nexus-Cache": "HIT" }
-    );
-  }
-
-  // 2. Fetch Context from Laravel API (Only takes ~50ms of HostGator PHP time)
+  // Fetch current authorization, history, and source relevance before every answer.
   const laravelApi = env.LARAVEL_API_URL.replace(/\/$/, "");
   let contextRes: Response;
   try {
@@ -116,11 +97,36 @@ async function handleChat(request: Request, env: Env, ctx: ExecutionContext): Pr
     sessionId: string;
     citations: Array<{ sourceId: string; title: string; chunk: number }>;
     model?: string;
+    grounded?: boolean;
+    refusal?: string;
   };
 
-  const finalSessionId = sessionId || contextData.sessionId || crypto.randomUUID();
+  const finalSessionId = contextData.sessionId || sessionId || crypto.randomUUID();
+  if (contextData.grounded !== true) {
+    const refusal = contextData.refusal ||
+      "I couldn’t find an answer to that in this subject’s uploaded sources, so I can’t answer it from the Notebook.";
+    const responsePayload = {
+      sessionId: finalSessionId,
+      answer: refusal,
+      response: refusal,
+      message: refusal,
+      content: refusal,
+      citations: [],
+      studyAid: null,
+    };
+    recordMessage(ctx, laravelApi, authHeader, {
+      subjectId,
+      sessionId: finalSessionId,
+      userQuestion: cleanQuestion,
+      answer: refusal,
+      citations: [],
+      studyAid: null,
+    });
 
-  // 3. Call Ollama Cloud directly from Cloudflare Edge (ZERO PHP Entry Processes held on HostGator!)
+    return jsonResponse(responsePayload);
+  }
+
+  // Call the configured chat provider directly from Cloudflare Edge.
   const model = env.OLLAMA_MODEL || contextData.model || "gemma4:31b";
   const messages = [
     {
@@ -188,18 +194,31 @@ async function handleChat(request: Request, env: Env, ctx: ExecutionContext): Pr
     studyAid,
   };
 
-  // 4. Cache Response at Edge (12 hours) for instant hits
-  if (!studyAidMode) {
-    const cacheResponseObj = new Response(JSON.stringify(responsePayload), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=43200", // 12 hours
-      },
-    });
-    ctx.waitUntil(cache.put(cacheKeyUrl.toString(), cacheResponseObj));
-  }
+  recordMessage(ctx, laravelApi, authHeader, {
+    subjectId,
+    sessionId: finalSessionId,
+    userQuestion: cleanQuestion,
+    answer: answerText,
+    citations: contextData.citations || [],
+    studyAid,
+  });
 
-  // 5. Asynchronously record the message in Laravel MySQL in background (ctx.waitUntil)
+  return jsonResponse(responsePayload);
+}
+
+function recordMessage(
+  ctx: ExecutionContext,
+  laravelApi: string,
+  authHeader: string,
+  message: {
+    subjectId: string;
+    sessionId: string;
+    userQuestion: string;
+    answer: string;
+    citations: Array<{ sourceId: string; title: string; chunk: number }>;
+    studyAid: unknown;
+  }
+): void {
   ctx.waitUntil(
     fetch(`${laravelApi}/api/ai-notebook/record-message`, {
       method: "POST",
@@ -207,18 +226,9 @@ async function handleChat(request: Request, env: Env, ctx: ExecutionContext): Pr
         "Content-Type": "application/json",
         Authorization: authHeader,
       },
-      body: JSON.stringify({
-        subjectId,
-        sessionId: finalSessionId,
-        userQuestion: cleanQuestion,
-        answer: answerText,
-        citations: contextData.citations || [],
-        studyAid,
-      }),
+      body: JSON.stringify(message),
     }).catch(() => {})
   );
-
-  return jsonResponse(responsePayload);
 }
 
 function parseMindMap(raw: string): { title: string; branches: any[]; type: string } {
@@ -237,14 +247,6 @@ function parseMindMap(raw: string): { title: string; branches: any[]; type: stri
     title: "Study Mind Map",
     branches: [],
   };
-}
-
-async function sha256(str: string): Promise<string> {
-  const buf = new TextEncoder().encode(str);
-  const hash = await crypto.subtle.digest("SHA-256", buf);
-  return Array.from(new Uint8Array(hash))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 function jsonResponse(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
